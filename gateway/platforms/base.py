@@ -348,26 +348,64 @@ class MessageEvent:
     timestamp: datetime = field(default_factory=datetime.now)
     
     def is_command(self) -> bool:
-        """Check if this is a command message (e.g., /new, /reset)."""
-        return self.text.startswith("/")
-    
+        """Check if this is a command message (e.g., /new, /reset).
+
+        Handles both:
+        - /approve              (slash at start)
+        - @Hermes /approve     (slash after mention)
+        """
+        text = self.text.lstrip()
+        return text.startswith("/") or (" /" in self.text)
+
     def get_command(self) -> Optional[str]:
-        """Extract command name if this is a command message."""
+        """Extract command name if this is a command message.
+
+        Handles both:
+        - /approve           → "approve"
+        - @Hermes /approve  → "approve"
+        """
         if not self.is_command():
             return None
-        # Split on space and get first word, strip the /
-        parts = self.text.split(maxsplit=1)
-        raw = parts[0][1:].lower() if parts else None
-        if raw and "@" in raw:
-            raw = raw.split("@", 1)[0]
-        return raw
-    
+        # Find the last /word pattern, handling @mention /command
+        parts = self.text.split(" /")
+        if len(parts) < 2:
+            # No " /" found, must be /command at start
+            slash_pos = self.text.find("/")
+            if slash_pos < 0:
+                return None
+            remainder = self.text[slash_pos + 1:]
+        else:
+            remainder = parts[-1]
+        # Extract command name (alphanumeric)
+        cmd_parts = remainder.split()
+        if not cmd_parts:
+            return None
+        return cmd_parts[0].lower()
+
     def get_command_args(self) -> str:
-        """Get the arguments after a command."""
+        """Get the arguments after a command.
+
+        Handles both:
+        - /approve session  → "session"
+        - @Hermes /approve session  → "session"
+        """
         if not self.is_command():
             return self.text
-        parts = self.text.split(maxsplit=1)
-        return parts[1] if len(parts) > 1 else ""
+        # Find the last /command and return everything after it
+        parts = self.text.split(" /")
+        if len(parts) < 2:
+            # No " /" found, must be /command at start
+            slash_pos = self.text.find("/")
+            if slash_pos < 0:
+                return ""
+            remainder = self.text[slash_pos:]
+        else:
+            remainder = "/" + parts[-1]
+        # remainder is like "/approve" or "/approve session"
+        space_pos = remainder.find(" ")
+        if space_pos < 0:
+            return ""
+        return remainder[space_pos + 1:].strip()
 
 
 @dataclass 

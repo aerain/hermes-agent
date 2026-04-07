@@ -63,6 +63,7 @@ class Platform(Enum):
     WEBHOOK = "webhook"
     FEISHU = "feishu"
     WECOM = "wecom"
+    LINEAR = "linear"
 
 
 @dataclass
@@ -285,6 +286,9 @@ class GatewayConfig:
                 connected.append(platform)
             # WeCom uses extra dict for bot credentials
             elif platform == Platform.WECOM and config.extra.get("bot_id"):
+                connected.append(platform)
+            # Linear uses extra dict for OAuth client credentials
+            elif platform == Platform.LINEAR and config.extra.get("client_id"):
                 connected.append(platform)
         return connected
     
@@ -916,6 +920,36 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 chat_id=wecom_home,
                 name=os.getenv("WECOM_HOME_CHANNEL_NAME", "Home"),
             )
+
+    # Linear
+    linear_client_id = os.getenv("LINEAR_CLIENT_ID")
+    linear_client_secret = os.getenv("LINEAR_CLIENT_SECRET")
+    if linear_client_id and linear_client_secret:
+        if Platform.LINEAR not in config.platforms:
+            config.platforms[Platform.LINEAR] = PlatformConfig()
+        config.platforms[Platform.LINEAR].enabled = True
+        config.platforms[Platform.LINEAR].extra.update({
+            "client_id": linear_client_id,
+            "client_secret": linear_client_secret,
+        })
+        linear_webhook_secret = os.getenv("LINEAR_WEBHOOK_SECRET")
+        if linear_webhook_secret:
+            config.platforms[Platform.LINEAR].extra["webhook_secret"] = linear_webhook_secret
+        linear_webhook_base_url = os.getenv("LINEAR_WEBHOOK_BASE_URL")
+        if linear_webhook_base_url:
+            config.platforms[Platform.LINEAR].extra["webhook_base_url"] = linear_webhook_base_url.rstrip("/")
+        linear_webhook_port = os.getenv("LINEAR_WEBHOOK_PORT")
+        if linear_webhook_port:
+            try:
+                config.platforms[Platform.LINEAR].extra["webhook_port"] = int(linear_webhook_port)
+            except ValueError:
+                pass
+        linear_team_id = os.getenv("LINEAR_TEAM_ID")
+        if linear_team_id:
+            config.platforms[Platform.LINEAR].extra["team_id"] = linear_team_id
+        linear_bot_user_id = os.getenv("LINEAR_BOT_USER_ID")
+        if linear_bot_user_id:
+            config.platforms[Platform.LINEAR].extra["bot_user_id"] = linear_bot_user_id
 
     # Session settings
     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")

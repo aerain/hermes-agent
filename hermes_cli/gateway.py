@@ -1443,6 +1443,30 @@ _PLATFORMS = [
              "help": "Chat ID for scheduled results and notifications."},
         ],
     },
+    {
+        "key": "linear",
+        "label": "Linear",
+        "emoji": "🔴",
+        "token_var": "LINEAR_ACCESS_TOKEN",
+        "setup_instructions": [
+            "1. Go to Linear.app → Settings → API → OAuth Applications",
+            "2. Create new OAuth app. Callback URL: {BASE_URL}/callback",
+            "3. Enable Webhooks. Webhook URL: {BASE_URL}/webhook/linear",
+            "4. Copy Client ID, Client Secret, and Webhook Signing Secret below",
+        ],
+        "vars": [
+            {"name": "LINEAR_WEBHOOK_BASE_URL", "prompt": "Gateway Base URL (public, e.g. https://my-gateway.fly.dev)", "password": False,
+             "help": "Public URL where your gateway is hosted. Linear sends webhooks here."},
+            {"name": "LINEAR_CLIENT_ID", "prompt": "Client ID", "password": False,
+             "help": "From your OAuth Application settings page."},
+            {"name": "LINEAR_CLIENT_SECRET", "prompt": "Client Secret", "password": True,
+             "help": "Shown only once when created — copy it now."},
+            {"name": "LINEAR_WEBHOOK_SECRET", "prompt": "Webhook Signing Secret", "password": True,
+             "help": "Found in webhook settings after enabling webhooks."},
+            {"name": "LINEAR_BOT_USER_ID", "prompt": "Bot User ID (optional, for mention detection)", "password": False,
+             "help": "Your Linear user ID for @mention detection."},
+        ],
+    },
 ]
 
 
@@ -1485,6 +1509,13 @@ def _platform_status(platform: dict) -> str:
             suffix = " + E2EE" if e2ee and e2ee.lower() in ("true", "1", "yes") else ""
             return f"configured{suffix}"
         if val or password or homeserver:
+            return "partially configured"
+        return "not configured"
+    if platform.get("key") == "linear":
+        client_id = get_env_value("LINEAR_CLIENT_ID")
+        if val and client_id:
+            return "configured"
+        if val or client_id:
             return "partially configured"
         return "not configured"
     if val:
@@ -1783,6 +1814,267 @@ def _setup_signal():
     print_info(f"  Groups: {'enabled' if get_env_value('SIGNAL_GROUP_ALLOWED_USERS') else 'disabled'}")
 
 
+def _setup_linear():
+    """Interactive setup for Linear with OAuth authentication."""
+    import json
+    import socket
+    import threading
+    import time
+    import webbrowser
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from urllib.parse import parse_qs, urlparse
+
+    from gateway.platforms.linear import _load_tokens, _save_tokens
+
+    print()
+    print(color("  ─── 🔴 Linear Setup ───", Colors.CYAN))
+
+    existing_client_id = get_env_value("LINEAR_CLIENT_ID")
+    existing_client_secret = get_env_value("LINEAR_CLIENT_SECRET")
+    existing_base_url = get_env_value("LINEAR_WEBHOOK_BASE_URL")
+    existing_tokens = _load_tokens()
+
+    already_authenticated = bool(existing_tokens.get("access_token") and existing_client_id)
+    if already_authenticated:
+        print_success("  Linear is already authenticated.")
+    else:
+        print_info("  You need a Linear OAuth application to use the Linear gateway.")
+        print_info("  Create one at: Linear.app → Settings → API → OAuth Applications")
+        print()
+
+        # Gateway public base URL
+        if existing_base_url:
+            print_info(f"  Gateway Base URL: {existing_base_url}")
+        else:
+            base_url = prompt("  Gateway Base URL (e.g. https://my-gateway.fly.dev)")
+            if not base_url:
+                print_error("  Gateway Base URL is required.")
+                return
+            save_env_value("LINEAR_WEBHOOK_BASE_URL", base_url.rstrip("/"))
+            existing_base_url = base_url
+            print_success("  Gateway Base URL saved.")
+
+        # Collect OAuth credentials
+        if not existing_client_id:
+            client_id = prompt("  Client ID")
+            if not client_id:
+                print_error("  Client ID is required.")
+                return
+            save_env_value("LINEAR_CLIENT_ID", client_id)
+        else:
+            client_id = existing_client_id
+            print_info(f"  Client ID: {existing_client_id[:20]}...")
+
+        if not existing_client_secret:
+            client_secret = prompt("  Client Secret", password=True)
+            if not client_secret:
+                print_error("  Client Secret is required.")
+                return
+            save_env_value("LINEAR_CLIENT_SECRET", client_secret)
+        else:
+            client_secret = existing_client_secret
+            print_info("  Client Secret: [configured]")
+
+    # Ask to re-run OAuth even if already authenticated
+    if already_authenticated:
+        print()
+        if not prompt_yes_no("  Re-run OAuth authorization?", False):
+            # Skip to webhook port / team config
+            print()
+            default_port = get_env_value("LINEAR_WEBHOOK_PORT") or "8645"
+            port_input = prompt(f"  Webhook port", default=default_port)
+            if port_input:
+                save_env_value("LINEAR_WEBHOOK_PORT", port_input)
+                print_success(f"  Webhook port saved: {port_input}")
+
+            print()
+            existing_team = get_env_value("LINEAR_TEAM_ID") or ""
+            team_id = prompt("  Team ID (optional — monitor specific team only, press Enter to skip)", default=existing_team)
+            if team_id:
+                save_env_value("LINEAR_TEAM_ID", team_id)
+                print_info(f"  Team ID: {team_id}")
+            else:
+                print_info("  Skipped — all teams will be monitored.")
+
+            print()
+            print_success("  🔴 Linear configured!")
+            return
+
+        # Use existing credentials for OAuth
+        client_id = existing_client_id
+        client_secret = existing_client_secret
+        print_info(f"  Using existing Client ID: {existing_client_id[:20]}...")
+        print_info("  Client Secret: [configured]")
+
+        if existing_base_url:
+            port = get_env_value("LINEAR_WEBHOOK_PORT") or "8645"
+            base = existing_base_url.rstrip("/")
+            print_info(f"  Configure your Linear OAuth app with:")
+            print_info(f"    Callback URL:  {base}:{port}/callback")
+            print_info(f"    Webhook URL:   {base}:{port}/webhook/linear")
+
+        webhook_secret = prompt("  Webhook Signing Secret (optional)", password=True)
+        if webhook_secret:
+            save_env_value("LINEAR_WEBHOOK_SECRET", webhook_secret)
+            print_success("  Webhook secret saved.")
+        else:
+            print_info("  Skipped — webhook verification will be disabled.")
+
+        # OAuth authorization
+        print()
+        if not prompt_yes_no("  Start OAuth authorization now?", True):
+            print_info("  Skipped — run setup again to authenticate later.")
+            return
+
+        # Find free port for callback server
+        def _find_free_port():
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", 0))
+                return s.getsockname()[1]
+
+        if existing_base_url:
+            port = int(get_env_value("LINEAR_WEBHOOK_PORT") or "8645")
+            base = existing_base_url.rstrip("/")
+            redirect_uri = f"{base}:{port}/callback"
+        else:
+            port = _find_free_port()
+            redirect_uri = f"http://localhost:{port}/callback"
+
+        # Build OAuth URL
+        oauth_url = (
+            "https://linear.app/oauth/authorize"
+            f"?client_id={client_id}"
+            f"&redirect_uri={redirect_uri}"
+            "&response_type=code"
+            "&scope=write,app:assignable,app:mentionable"
+            "&actor=app"
+            "&prompt=consent"
+        )
+
+        # Callback result storage
+        result = {"code": None, "state": None, "error": None}
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                qs = parse_qs(urlparse(self.path).query)
+                result["code"] = (qs.get("code") or [None])[0]
+                result["state"] = (qs.get("state") or [None])[0]
+                result["error"] = (qs.get("error") or [None])[0]
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(
+                    b"<html><body><h3>Authorization complete. You can close this tab.</h3></body></html>"
+                )
+
+            def log_message(self, *_args):
+                pass
+
+        # Start callback server
+        server = HTTPServer(("127.0.0.1", port), _Handler)
+
+        def _serve():
+            server.timeout = 120
+            server.handle_request()
+
+        thread = threading.Thread(target=_serve, daemon=True)
+        thread.start()
+
+        # Open browser
+        print_info("  Opening browser for Linear authorization...")
+        print_info(f"  If no browser opens, go to:\n  {oauth_url}")
+        try:
+            webbrowser.open(oauth_url)
+        except Exception:
+            pass
+
+        # Wait for callback
+        print_info("  Waiting for authorization callback...")
+        for _ in range(1200):  # 120 seconds
+            time.sleep(0.1)
+            if result["code"] or result["error"]:
+                break
+
+        server.server_close()
+
+        if result["error"]:
+            print_error(f"  Authorization error: {result['error']}")
+            return
+
+        code = result["code"]
+        if not code:
+            print_error("  Authorization timed out (120s). Try again.")
+            return
+
+        # Exchange code for tokens
+        print_info("  Exchanging authorization code for access token...")
+        try:
+            import urllib.request
+            import urllib.parse
+
+            data = urllib.parse.urlencode({
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "grant_type": "authorization_code",
+            }).encode()
+
+            req = urllib.request.Request(
+                "https://api.linear.app/oauth/token",
+                data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                token_data = json.loads(resp.read())
+
+            access_token = token_data.get("access_token")
+            refresh_token = token_data.get("refresh_token")
+            expires_in = token_data.get("expires_in", 86400)
+
+            if not access_token:
+                print_error("  No access token received.")
+                return
+
+            _save_tokens({
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "expires_at": time.time() + expires_in,
+                "client_id": client_id,
+            })
+            print_success("  Access token received!")
+
+        except Exception as e:
+            print_error(f"  Token exchange failed: {e}")
+            return
+
+    # Webhook port
+    print()
+    default_port = get_env_value("LINEAR_WEBHOOK_PORT") or "8645"
+    port_input = prompt(f"  Webhook port", default=default_port)
+    if port_input:
+        save_env_value("LINEAR_WEBHOOK_PORT", port_input)
+        print_success(f"  Webhook port saved: {port_input}")
+
+    # Team ID (optional)
+    print()
+    existing_team = get_env_value("LINEAR_TEAM_ID") or ""
+    team_id = prompt("  Team ID (optional — monitor specific team only, press Enter to skip)", default=existing_team)
+    if team_id:
+        save_env_value("LINEAR_TEAM_ID", team_id)
+        print_info(f"  Team ID: {team_id}")
+    else:
+        print_info("  Skipped — all teams will be monitored.")
+
+    print()
+    print_success("  🔴 Linear configured!")
+    base_url_display = get_env_value("LINEAR_WEBHOOK_BASE_URL") or existing_base_url or ""
+    if base_url_display:
+        print_info("  Configure your Linear OAuth app with:")
+        print_info(f"    Callback URL:  {base_url_display}/callback")
+        print_info(f"    Webhook URL:  {base_url_display}/webhook/linear")
+
+
 def gateway_setup():
     """Interactive setup for messaging platforms + gateway service."""
     if is_managed():
@@ -1844,6 +2136,8 @@ def gateway_setup():
             _setup_whatsapp()
         elif platform["key"] == "signal":
             _setup_signal()
+        elif platform["key"] == "linear":
+            _setup_linear()
         else:
             _setup_standard_platform(platform)
 

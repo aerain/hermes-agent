@@ -31,6 +31,7 @@ PLATFORMS = {
     "feishu": "🪽 Feishu",
     "wecom": "💬 WeCom",
     "webhook": "🔗 Webhook",
+    "linear": "📊 Linear",
 }
 
 # ─── Config Helpers ───────────────────────────────────────────────────────────

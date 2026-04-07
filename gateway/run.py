@@ -1583,6 +1583,13 @@ class GatewayRunner:
             adapter.gateway_runner = self  # For cross-platform delivery
             return adapter
 
+        elif platform == Platform.LINEAR:
+            from gateway.platforms.linear import LinearAdapter, check_linear_requirements
+            if not check_linear_requirements():
+                logger.warning("Linear: aiohttp not installed or LINEAR_CLIENT_ID/CLIENT_SECRET not set")
+                return None
+            return LinearAdapter(config)
+
         return None
     
     def _is_user_authorized(self, source: SessionSource) -> bool:
