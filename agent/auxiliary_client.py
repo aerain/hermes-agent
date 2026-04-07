@@ -34,6 +34,12 @@ than the provider's default.
 Per-task direct endpoint overrides (e.g. AUXILIARY_VISION_BASE_URL,
 AUXILIARY_VISION_API_KEY) let callers route a specific auxiliary task to a
 custom OpenAI-compatible endpoint without touching the main model settings.
+
+Payment / credit exhaustion fallback:
+  When a resolved provider returns HTTP 402 or a credit-related error,
+  call_llm() automatically retries with the next available provider in the
+  auto-detection chain.  This handles the common case where a user depletes
+  their OpenRouter balance but has Codex OAuth or another provider available.
 """
 
 import json
@@ -55,6 +61,7 @@ logger = logging.getLogger(__name__)
 
 # Default auxiliary models for direct API-key providers (cheap/fast for side tasks)
 _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = {
+    "gemini": "gemini-3-flash-preview",
     "zai": "glm-4.5-flash",
     "kimi-coding": "kimi-k2-turbo-preview",
     "minimax": "MiniMax-M2.7-highspeed",
@@ -253,26 +260,73 @@ class _CodexCompletionsAdapter:
         usage = None
 
         try:
+            # Collect output items and text deltas during streaming —
+            # the Codex backend can return empty response.output from
+            # get_final_response() even when items were streamed.
+            collected_output_items: List[Any] = []
+            collected_text_deltas: List[str] = []
+            has_function_calls = False
             with self._client.responses.stream(**resp_kwargs) as stream:
                 for _event in stream:
-                    pass
+                    _etype = getattr(_event, "type", "")
+                    if _etype == "response.output_item.done":
+                        _done = getattr(_event, "item", None)
+                        if _done is not None:
+                            collected_output_items.append(_done)
+                    elif "output_text.delta" in _etype:
+                        _delta = getattr(_event, "delta", "")
+                        if _delta:
+                            collected_text_deltas.append(_delta)
+                    elif "function_call" in _etype:
+                        has_function_calls = True
                 final = stream.get_final_response()
 
-            # Extract text and tool calls from the Responses output
+            # Backfill empty output from collected stream events
+            _output = getattr(final, "output", None)
+            if isinstance(_output, list) and not _output:
+                if collected_output_items:
+                    final.output = list(collected_output_items)
+                    logger.debug(
+                        "Codex auxiliary: backfilled %d output items from stream events",
+                        len(collected_output_items),
+                    )
+                elif collected_text_deltas and not has_function_calls:
+                    # Only synthesize text when no tool calls were streamed —
+                    # a function_call response with incidental text should not
+                    # be collapsed into a plain-text message.
+                    assembled = "".join(collected_text_deltas)
+                    final.output = [SimpleNamespace(
+                        type="message", role="assistant", status="completed",
+                        content=[SimpleNamespace(type="output_text", text=assembled)],
+                    )]
+                    logger.debug(
+                        "Codex auxiliary: synthesized from %d deltas (%d chars)",
+                        len(collected_text_deltas), len(assembled),
+                    )
+
+            # Extract text and tool calls from the Responses output.
+            # Items may be SDK objects (attrs) or dicts (raw/fallback paths),
+            # so use a helper that handles both shapes.
+            def _item_get(obj: Any, key: str, default: Any = None) -> Any:
+                val = getattr(obj, key, None)
+                if val is None and isinstance(obj, dict):
+                    val = obj.get(key, default)
+                return val if val is not None else default
+
             for item in getattr(final, "output", []):
-                item_type = getattr(item, "type", None)
+                item_type = _item_get(item, "type")
                 if item_type == "message":
-                    for part in getattr(item, "content", []):
-                        ptype = getattr(part, "type", None)
+                    for part in (_item_get(item, "content") or []):
+                        ptype = _item_get(part, "type")
                         if ptype in ("output_text", "text"):
-                            text_parts.append(getattr(part, "text", ""))
+                            text_parts.append(_item_get(part, "text", ""))
                 elif item_type == "function_call":
                     tool_calls_raw.append(SimpleNamespace(
-                        id=getattr(item, "call_id", ""),
+                        id=_item_get(item, "call_id", ""),
                         type="function",
                         function=SimpleNamespace(
-                            name=getattr(item, "name", ""),
-                            arguments=getattr(item, "arguments", "{}"),
+                            name=_item_get(item, "name", ""),
+                            arguments=_item_get(item, "arguments", "{}"),
                         ),
                     ))
 
@@ -842,7 +896,7 @@ def _resolve_forced_provider(forced: str) -> Tuple[Optional[OpenAI], Optional[st
     if forced == "nous":
         client, model = _try_nous()
         if client is None:
-            logger.warning("auxiliary.provider=nous but Nous Portal not configured (run: hermes login)")
+            logger.warning("auxiliary.provider=nous but Nous Portal not configured (run: hermes auth)")
         return client, model
 
     if forced == "codex":
@@ -873,8 +927,88 @@ _AUTO_PROVIDER_LABELS = {
     "_resolve_api_key_provider": "api-key",
 }
 
-
 _AGGREGATOR_PROVIDERS = frozenset({"openrouter", "nous"})
+
+
+def _get_provider_chain() -> List[tuple]:
+    """Return the ordered provider detection chain.
+
+    Built at call time (not module level) so that test patches
+    on the ``_try_*`` functions are picked up correctly.
+    """
+    return [
+        ("openrouter", _try_openrouter),
+        ("nous", _try_nous),
+        ("local/custom", _try_custom_endpoint),
+        ("openai-codex", _try_codex),
+        ("api-key", _resolve_api_key_provider),
+    ]
+
+
+def _is_payment_error(exc: Exception) -> bool:
+    """Detect payment/credit/quota exhaustion errors.
+
+    Returns True for HTTP 402 (Payment Required) and for 429/other errors
+    whose message indicates billing exhaustion rather than rate limiting.
+    """
+    status = getattr(exc, "status_code", None)
+    if status == 402:
+        return True
+    err_lower = str(exc).lower()
+    # OpenRouter and other providers include "credits" or "afford" in 402 bodies,
+    # but sometimes wrap them in 429 or other codes.
+    if status in (402, 429, None):
+        if any(kw in err_lower for kw in ("credits", "insufficient funds",
+                                           "can only afford", "billing",
+                                           "payment required")):
+            return True
+    return False
+
+
+def _try_payment_fallback(
+    failed_provider: str,
+    task: str = None,
+) -> Tuple[Optional[Any], Optional[str], str]:
+    """Try alternative providers after a payment/credit error.
+
+    Iterates the standard auto-detection chain, skipping the provider that
+    returned a payment error.
+
+    Returns:
+        (client, model, provider_label) or (None, None, "") if no fallback.
+    """
+    # Normalise the failed provider label for matching.
+    skip = failed_provider.lower().strip()
+    # Also skip Step-1 main-provider path if it maps to the same backend.
+    # (e.g. main_provider="openrouter" → skip "openrouter" in chain)
+    main_provider = _read_main_provider()
+    skip_labels = {skip}
+    if main_provider and main_provider.lower() in skip:
+        skip_labels.add(main_provider.lower())
+    # Map common resolved_provider values back to chain labels.
+    _alias_to_label = {"openrouter": "openrouter", "nous": "nous",
+                       "openai-codex": "openai-codex", "codex": "openai-codex",
+                       "custom": "local/custom", "local/custom": "local/custom"}
+    skip_chain_labels = {_alias_to_label.get(s, s) for s in skip_labels}
+
+    tried = []
+    for label, try_fn in _get_provider_chain():
+        if label in skip_chain_labels:
+            continue
+        client, model = try_fn()
+        if client is not None:
+            logger.info(
+                "Auxiliary %s: payment error on %s — falling back to %s (%s)",
+                task or "call", failed_provider, label, model or "default",
+            )
+            return client, model, label
+        tried.append(label)
+
+    logger.warning(
+        "Auxiliary %s: payment error on %s and no fallback available (tried: %s)",
+        task or "call", failed_provider, ", ".join(tried),
+    )
+    return None, None, ""
 
 
 def _resolve_auto() -> Tuple[Optional[OpenAI], Optional[str]]:
@@ -904,10 +1038,7 @@ def _resolve_auto() -> Tuple[Optional[OpenAI], Optional[str]]:
 
     # ── Step 2: aggregator / fallback chain ──────────────────────────────
     tried = []
-    for try_fn in (_try_openrouter, _try_nous, _try_custom_endpoint,
-                   _try_codex, _resolve_api_key_provider):
-        fn_name = getattr(try_fn, "__name__", "unknown")
-        label = _AUTO_PROVIDER_LABELS.get(fn_name, fn_name)
+    for label, try_fn in _get_provider_chain():
         client, model = try_fn()
         if client is not None:
             if tried:
@@ -1035,7 +1166,7 @@ def resolve_provider_client(
         client, default = _try_nous()
         if client is None:
             logger.warning("resolve_provider_client: nous requested "
-                           "but Nous Portal not configured (run: hermes login)")
+                           "but Nous Portal not configured (run: hermes auth)")
             return None, None
         final_model = model or default
         return (_to_async_client(client, final_model) if async_mode
@@ -1785,12 +1916,15 @@ def call_llm(
                     f"was found. Set the {_explicit.upper()}_API_KEY environment "
                     f"variable, or switch to a different provider with `hermes model`."
                 )
-            # For auto/custom, fall back to OpenRouter
+            # For auto/custom with no credentials, try the full auto chain
+            # rather than hardcoding OpenRouter (which may be depleted).
+            # Pass model=None so each provider uses its own default —
+            # resolved_model may be an OpenRouter-format slug that doesn't
+            # work on other providers.
             if not resolved_base_url:
-                logger.info("Auxiliary %s: provider %s unavailable, falling back to openrouter",
+                logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
-                client, final_model = _get_cached_client(
-                    "openrouter", resolved_model or _OPENROUTER_MODEL)
+                client, final_model = _get_cached_client("auto")
         if client is None:
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
@@ -1811,7 +1945,7 @@ def call_llm(
         tools=tools, timeout=effective_timeout, extra_body=extra_body,
         base_url=resolved_base_url)
 
-    # Handle max_tokens vs max_completion_tokens retry
+    # Handle max_tokens vs max_completion_tokens retry, then payment fallback.
     try:
         return client.chat.completions.create(**kwargs)
     except Exception as first_err:
@@ -1819,7 +1953,30 @@ def call_llm(
         if "max_tokens" in err_str or "unsupported_parameter" in err_str:
             kwargs.pop("max_tokens", None)
             kwargs["max_completion_tokens"] = max_tokens
-            return client.chat.completions.create(**kwargs)
+            try:
+                return client.chat.completions.create(**kwargs)
+            except Exception as retry_err:
+                # If the max_tokens retry also hits a payment error,
+                # fall through to the payment fallback below.
+                if not _is_payment_error(retry_err):
+                    raise
+                first_err = retry_err
+
+        # ── Payment / credit exhaustion fallback ──────────────────────
+        # When the resolved provider returns 402 or a credit-related error,
+        # try alternative providers instead of giving up.  This handles the
+        # common case where a user runs out of OpenRouter credits but has
+        # Codex OAuth or another provider available.
+        if _is_payment_error(first_err):
+            fb_client, fb_model, fb_label = _try_payment_fallback(
+                resolved_provider, task)
+            if fb_client is not None:
+                fb_kwargs = _build_call_kwargs(
+                    fb_label, fb_model, messages,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, timeout=effective_timeout,
+                    extra_body=extra_body)
+                return fb_client.chat.completions.create(**fb_kwargs)
         raise
 
 

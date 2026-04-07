@@ -1,12 +1,12 @@
 ---
 sidebar_position: 4
 title: "Memory Providers"
-description: "External memory provider plugins — Honcho, OpenViking, Mem0, Hindsight, Holographic, RetainDB, ByteRover"
+description: "External memory provider plugins — Honcho, OpenViking, Mem0, Hindsight, Holographic, RetainDB, ByteRover, Supermemory"
 ---
 
 # Memory Providers
 
-Hermes Agent ships with 7 external memory provider plugins that give the agent persistent, cross-session knowledge beyond the built-in MEMORY.md and USER.md. Only **one** external provider can be active at a time — the built-in memory is always active alongside it.
+Hermes Agent ships with 8 external memory provider plugins that give the agent persistent, cross-session knowledge beyond the built-in MEMORY.md and USER.md. Only **one** external provider can be active at a time — the built-in memory is always active alongside it.
 
 ## Quick Start
 
@@ -20,7 +20,7 @@ Or set manually in `~/.hermes/config.yaml`:
 
 ```yaml
 memory:
-  provider: openviking   # or honcho, mem0, hindsight, holographic, retaindb, byterover
+  provider: openviking   # or honcho, mem0, hindsight, holographic, retaindb, byterover, supermemory
 ```
 
 ## How It Works
@@ -44,26 +44,157 @@ AI-native cross-session user modeling with dialectic Q&A, semantic search, and p
 
 | | |
 |---|---|
-| **Best for** | Teams using Honcho's user modeling platform |
-| **Requires** | `pip install honcho-ai` + API key |
-| **Data storage** | Honcho Cloud |
-| **Cost** | Honcho pricing |
+| **Best for** | Multi-agent systems with cross-session context, user-agent alignment |
+| **Requires** | `pip install honcho-ai` + [API key](https://app.honcho.dev) or self-hosted instance |
+| **Data storage** | Honcho Cloud or self-hosted |
+| **Cost** | Honcho pricing (cloud) / free (self-hosted) |
 
 **Tools:** `honcho_profile` (peer card), `honcho_search` (semantic search), `honcho_context` (LLM-synthesized), `honcho_conclude` (store facts)
 
-**Setup:**
+**Setup Wizard:**
 ```bash
-hermes memory setup    # select "honcho"
-# Or manually:
-hermes config set memory.provider honcho
-echo "HONCHO_API_KEY=your-key" >> ~/.hermes/.env
+hermes honcho setup        # (legacy command) 
+# or
+hermes memory setup        # select "honcho"
 ```
 
-**Config:** `$HERMES_HOME/honcho.json` — existing Honcho users' configuration and data are fully preserved.
+**Config:** `$HERMES_HOME/honcho.json` (profile-local) or `~/.honcho/config.json` (global). Resolution order: `$HERMES_HOME/honcho.json` > `~/.hermes/honcho.json` > `~/.honcho/config.json`. See the [config reference](https://github.com/hermes-ai/hermes-agent/blob/main/plugins/memory/honcho/README.md) and the [Honcho integration guide](https://docs.honcho.dev/v3/guides/integrations/hermes).
+
+<details>
+<summary>Key config options</summary>
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `apiKey` | -- | API key from [app.honcho.dev](https://app.honcho.dev) |
+| `baseUrl` | -- | Base URL for self-hosted Honcho |
+| `peerName` | -- | User peer identity |
+| `aiPeer` | host key | AI peer identity (one per profile) |
+| `workspace` | host key | Shared workspace ID |
+| `recallMode` | `hybrid` | `hybrid` (auto-inject + tools), `context` (inject only), `tools` (tools only) |
+| `observation` | all on | Per-peer `observeMe`/`observeOthers` booleans |
+| `writeFrequency` | `async` | `async`, `turn`, `session`, or integer N |
+| `sessionStrategy` | `per-directory` | `per-directory`, `per-repo`, `per-session`, `global` |
+| `dialecticReasoningLevel` | `low` | `minimal`, `low`, `medium`, `high`, `max` |
+| `dialecticDynamic` | `true` | Auto-bump reasoning by query length |
+| `messageMaxChars` | `25000` | Max chars per message (chunked if exceeded) |
+
+</details>
+
+<details>
+<summary>Minimal honcho.json (cloud)</summary>
+
+```json
+{
+  "apiKey": "your-key-from-app.honcho.dev",
+  "hosts": {
+    "hermes": {
+      "enabled": true,
+      "aiPeer": "hermes",
+      "peerName": "your-name",
+      "workspace": "hermes"
+    }
+  }
+}
+```
+
+</details>
+
+<details>
+<summary>Minimal honcho.json (self-hosted)</summary>
+
+```json
+{
+  "baseUrl": "http://localhost:8000",
+  "hosts": {
+    "hermes": {
+      "enabled": true,
+      "aiPeer": "hermes",
+      "peerName": "your-name",
+      "workspace": "hermes"
+    }
+  }
+}
+```
+
+</details>
 
 :::tip Migrating from `hermes honcho`
-If you previously used `hermes honcho setup`, your config and all server-side data are intact. Just set `memory.provider: honcho` to reactivate via the new system.
+If you previously used `hermes honcho setup`, your config and all server-side data are intact. Just re-enable through the setup wizard again or manually set `memory.provider: honcho` to reactivate via the new system.
 :::
+
+**Multi-agent / Profiles:**
+
+Each Hermes profile gets its own Honcho AI peer while sharing the same workspace -- all profiles see the same user representation, but each agent builds its own identity and observations.
+
+```bash
+hermes profile create coder --clone   # creates honcho peer "coder", inherits config from default
+```
+
+What `--clone` does: creates a `hermes.coder` host block in `honcho.json` with `aiPeer: "coder"`, shared `workspace`, inherited `peerName`, `recallMode`, `writeFrequency`, `observation`, etc. The peer is eagerly created in Honcho so it exists before first message.
+
+For profiles created before Honcho was set up:
+
+```bash
+hermes honcho sync   # scans all profiles, creates host blocks for any missing ones
+```
+
+This inherits settings from the default `hermes` host block and creates new AI peers for each profile. Idempotent -- skips profiles that already have a host block.
+
+<details>
+<summary>Full honcho.json example (multi-profile)</summary>
+
+```json
+{
+  "apiKey": "your-key",
+  "workspace": "hermes",
+  "peerName": "eri",
+  "hosts": {
+    "hermes": {
+      "enabled": true,
+      "aiPeer": "hermes",
+      "workspace": "hermes",
+      "peerName": "eri",
+      "recallMode": "hybrid",
+      "writeFrequency": "async",
+      "sessionStrategy": "per-directory",
+      "observation": {
+        "user": { "observeMe": true, "observeOthers": true },
+        "ai": { "observeMe": true, "observeOthers": true }
+      },
+      "dialecticReasoningLevel": "low",
+      "dialecticDynamic": true,
+      "dialecticMaxChars": 600,
+      "messageMaxChars": 25000,
+      "saveMessages": true
+    },
+    "hermes.coder": {
+      "enabled": true,
+      "aiPeer": "coder",
+      "workspace": "hermes",
+      "peerName": "eri",
+      "recallMode": "tools",
+      "observation": {
+        "user": { "observeMe": true, "observeOthers": false },
+        "ai": { "observeMe": true, "observeOthers": true }
+      }
+    },
+    "hermes.writer": {
+      "enabled": true,
+      "aiPeer": "writer",
+      "workspace": "hermes",
+      "peerName": "eri"
+    }
+  },
+  "sessions": {
+    "/home/user/myproject": "myproject-main"
+  }
+}
+```
+
+</details>
+
+See the [config reference](https://github.com/hermes-ai/hermes-agent/blob/main/plugins/memory/honcho/README.md) and [Honcho integration guide](https://docs.honcho.dev/v3/guides/integrations/hermes).
+
 
 ---
 
@@ -251,6 +382,47 @@ hermes config set memory.provider byterover
 
 ---
 
+### Supermemory
+
+Semantic long-term memory with profile recall, semantic search, explicit memory tools, and session-end conversation ingest via the Supermemory graph API.
+
+| | |
+|---|---|
+| **Best for** | Semantic recall with user profiling and session-level graph building |
+| **Requires** | `pip install supermemory` + [API key](https://supermemory.ai) |
+| **Data storage** | Supermemory Cloud |
+| **Cost** | Supermemory pricing |
+
+**Tools:** `supermemory_store` (save explicit memories), `supermemory_search` (semantic similarity search), `supermemory_forget` (forget by ID or best-match query), `supermemory_profile` (persistent profile + recent context)
+
+**Setup:**
+```bash
+hermes memory setup    # select "supermemory"
+# Or manually:
+hermes config set memory.provider supermemory
+echo 'SUPERMEMORY_API_KEY=your-key-here' >> ~/.hermes/.env
+```
+
+**Config:** `$HERMES_HOME/supermemory.json`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `container_tag` | `hermes` | Container tag used for search and writes |
+| `auto_recall` | `true` | Inject relevant memory context before turns |
+| `auto_capture` | `true` | Store cleaned user-assistant turns after each response |
+| `max_recall_results` | `10` | Max recalled items to format into context |
+| `profile_frequency` | `50` | Include profile facts on first turn and every N turns |
+| `capture_mode` | `all` | Skip tiny or trivial turns by default |
+| `api_timeout` | `5.0` | Timeout for SDK and ingest requests |
+
+**Key features:**
+- Automatic context fencing — strips recalled memories from captured turns to prevent recursive memory pollution
+- Session-end conversation ingest for richer graph-level knowledge building
+- Profile facts injected on first turn and at configurable intervals
+- Trivial message filtering (skips "ok", "thanks", etc.)
+
+---
+
 ## Provider Comparison
 
 | Provider | Storage | Cost | Tools | Dependencies | Unique Feature |
@@ -262,13 +434,14 @@ hermes config set memory.provider byterover
 | **Holographic** | Local | Free | 2 | None | HRR algebra + trust scoring |
 | **RetainDB** | Cloud | $20/mo | 5 | `requests` | Delta compression |
 | **ByteRover** | Local/Cloud | Free/Paid | 3 | `brv` CLI | Pre-compression extraction |
+| **Supermemory** | Cloud | Paid | 4 | `supermemory` | Context fencing + session graph ingest |
 
 ## Profile Isolation
 
 Each provider's data is isolated per [profile](/docs/user-guide/profiles):
 
 - **Local storage providers** (Holographic, ByteRover) use `$HERMES_HOME/` paths which differ per profile
-- **Config file providers** (Honcho, Mem0, Hindsight) store config in `$HERMES_HOME/` so each profile has its own credentials
+- **Config file providers** (Honcho, Mem0, Hindsight, Supermemory) store config in `$HERMES_HOME/` so each profile has its own credentials
 - **Cloud providers** (RetainDB) auto-derive profile-scoped project names
 - **Env var providers** (OpenViking) are configured via each profile's `.env` file
 

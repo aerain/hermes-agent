@@ -502,19 +502,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 self._set_fatal_error('discord_token_lock', message, retryable=False)
                 return False
 
-            # Set up intents -- members intent needed for username-to-ID resolution
-            intents = Intents.default()
-            intents.message_content = True
-            intents.dm_messages = True
-            intents.guild_messages = True
-            intents.members = True
-            intents.voice_states = True
-
-            # Create bot
-            self._client = commands.Bot(
-                command_prefix="!",  # Not really used, we handle raw messages
-                intents=intents,
-            )
 
             # Parse allowed user entries (may contain usernames or IDs)
             allowed_env = os.getenv("DISCORD_ALLOWED_USERS", "")
@@ -524,6 +511,25 @@ class DiscordAdapter(BasePlatformAdapter):
                     if uid.strip()
                 }
 
+            # Set up intents.
+            # Message Content is required for normal text replies.
+            # Server Members is only needed when the allowlist contains usernames
+            # that must be resolved to numeric IDs. Requesting privileged intents
+            # that aren't enabled in the Discord Developer Portal can prevent the
+            # bot from coming online at all, so avoid requesting members intent
+            # unless it is actually necessary.
+            intents = Intents.default()
+            intents.message_content = True
+            intents.dm_messages = True
+            intents.guild_messages = True
+            intents.members = any(not entry.isdigit() for entry in self._allowed_user_ids)
+            intents.voice_states = True
+
+            # Create bot
+            self._client = commands.Bot(
+                command_prefix="!",  # Not really used, we handle raw messages
+                intents=intents,
+            )
             adapter_self = self  # capture for closure
 
             # Register event handlers
@@ -648,9 +654,23 @@ class DiscordAdapter(BasePlatformAdapter):
 
         except asyncio.TimeoutError:
             logger.error("[%s] Timeout waiting for connection to Discord", self.name, exc_info=True)
+            try:
+                from gateway.status import release_scoped_lock
+                if getattr(self, '_token_lock_identity', None):
+                    release_scoped_lock('discord-bot-token', self._token_lock_identity)
+                    self._token_lock_identity = None
+            except Exception:
+                pass
             return False
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to connect to Discord: %s", self.name, e, exc_info=True)
+            try:
+                from gateway.status import release_scoped_lock
+                if getattr(self, '_token_lock_identity', None):
+                    release_scoped_lock('discord-bot-token', self._token_lock_identity)
+                    self._token_lock_identity = None
+            except Exception:
+                pass
             return False
 
     async def disconnect(self) -> None:
@@ -1660,6 +1680,62 @@ class DiscordAdapter(BasePlatformAdapter):
             await interaction.response.defer(ephemeral=True)
             await self._handle_thread_create_slash(interaction, name, message, auto_archive_duration)
 
+        @tree.command(name="queue", description="Queue a prompt for the next turn (doesn't interrupt)")
+        @discord.app_commands.describe(prompt="The prompt to queue")
+        async def slash_queue(interaction: discord.Interaction, prompt: str):
+            await self._run_simple_slash(interaction, f"/queue {prompt}", "Queued for the next turn.")
+
+        @tree.command(name="background", description="Run a prompt in the background")
+        @discord.app_commands.describe(prompt="The prompt to run in the background")
+        async def slash_background(interaction: discord.Interaction, prompt: str):
+            await self._run_simple_slash(interaction, f"/background {prompt}", "Background task started~")
+
+        @tree.command(name="btw", description="Ephemeral side question using session context")
+        @discord.app_commands.describe(question="Your side question (no tools, not persisted)")
+        async def slash_btw(interaction: discord.Interaction, question: str):
+            await self._run_simple_slash(interaction, f"/btw {question}")
+
+        # Register installed skills as native slash commands (parity with
+        # Telegram, which uses telegram_menu_commands() in commands.py).
+        # Discord allows up to 100 application commands globally.
+        _DISCORD_CMD_LIMIT = 100
+        try:
+            from hermes_cli.commands import discord_skill_commands
+
+            existing_names = {cmd.name for cmd in tree.get_commands()}
+            remaining_slots = max(0, _DISCORD_CMD_LIMIT - len(existing_names))
+
+            skill_entries, skipped = discord_skill_commands(
+                max_slots=remaining_slots,
+                reserved_names=existing_names,
+            )
+
+            for discord_name, description, cmd_key in skill_entries:
+                # Closure factory to capture cmd_key per iteration
+                def _make_skill_handler(_key: str):
+                    async def _skill_slash(interaction: discord.Interaction, args: str = ""):
+                        await self._run_simple_slash(interaction, f"{_key} {args}".strip())
+                    return _skill_slash
+
+                handler = _make_skill_handler(cmd_key)
+                handler.__name__ = f"skill_{discord_name.replace('-', '_')}"
+
+                cmd = discord.app_commands.Command(
+                    name=discord_name,
+                    description=description,
+                    callback=handler,
+                )
+                discord.app_commands.describe(args="Optional arguments for the skill")(cmd)
+                tree.add_command(cmd)
+
+            if skipped:
+                logger.warning(
+                    "[%s] Discord slash command limit reached (%d): %d skill(s) not registered",
+                    self.name, _DISCORD_CMD_LIMIT, skipped,
+                )
+        except Exception as exc:
+            logger.warning("[%s] Failed to register skill slash commands: %s", self.name, exc)
+
     def _build_slash_event(self, interaction: discord.Interaction, text: str) -> MessageEvent:
         """Build a MessageEvent from a Discord slash command interaction."""
         is_dm = isinstance(interaction.channel, discord.DMChannel)
@@ -1961,6 +2037,66 @@ class DiscordAdapter(BasePlatformAdapter):
             msg = await channel.send(embed=embed, view=view)
             return SendResult(success=True, message_id=str(msg.id))
         except Exception as e:
+            return SendResult(success=False, error=str(e))
+
+    async def send_model_picker(
+        self,
+        chat_id: str,
+        providers: list,
+        current_model: str,
+        current_provider: str,
+        session_key: str,
+        on_model_selected,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send an interactive select-menu model picker.
+
+        Two-step drill-down: provider dropdown → model dropdown.
+        Uses Discord embeds + Select menus via ``ModelPickerView``.
+        """
+        if not self._client or not DISCORD_AVAILABLE:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            # Resolve target channel (use thread_id if present)
+            target_id = chat_id
+            if metadata and metadata.get("thread_id"):
+                target_id = metadata["thread_id"]
+
+            channel = self._client.get_channel(int(target_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(target_id))
+
+            try:
+                from hermes_cli.providers import get_label
+                provider_label = get_label(current_provider)
+            except Exception:
+                provider_label = current_provider
+
+            embed = discord.Embed(
+                title="⚙ Model Configuration",
+                description=(
+                    f"Current model: `{current_model or 'unknown'}`\n"
+                    f"Provider: {provider_label}\n\n"
+                    f"Select a provider:"
+                ),
+                color=discord.Color.blue(),
+            )
+
+            view = ModelPickerView(
+                providers=providers,
+                current_model=current_model,
+                current_provider=current_provider,
+                session_key=session_key,
+                on_model_selected=on_model_selected,
+                allowed_user_ids=self._allowed_user_ids,
+            )
+
+            msg = await channel.send(embed=embed, view=view)
+            return SendResult(success=True, message_id=str(msg.id))
+
+        except Exception as e:
+            logger.warning("[%s] send_model_picker failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
     def _get_parent_channel_id(self, channel: Any) -> Optional[str]:
@@ -2454,3 +2590,218 @@ if DISCORD_AVAILABLE:
             self.resolved = True
             for child in self.children:
                 child.disabled = True
+
+    class ModelPickerView(discord.ui.View):
+        """Interactive select-menu view for model switching.
+
+        Two-step drill-down: provider dropdown → model dropdown.
+        Edits the original message in-place as the user navigates.
+        Times out after 2 minutes.
+        """
+
+        def __init__(
+            self,
+            providers: list,
+            current_model: str,
+            current_provider: str,
+            session_key: str,
+            on_model_selected,
+            allowed_user_ids: set,
+        ):
+            super().__init__(timeout=120)
+            self.providers = providers
+            self.current_model = current_model
+            self.current_provider = current_provider
+            self.session_key = session_key
+            self.on_model_selected = on_model_selected
+            self.allowed_user_ids = allowed_user_ids
+            self.resolved = False
+            self._selected_provider: str = ""
+
+            self._build_provider_select()
+
+        def _check_auth(self, interaction: discord.Interaction) -> bool:
+            if not self.allowed_user_ids:
+                return True
+            return str(interaction.user.id) in self.allowed_user_ids
+
+        def _build_provider_select(self):
+            """Build the provider dropdown menu."""
+            self.clear_items()
+            options = []
+            for p in self.providers:
+                count = p.get("total_models", len(p.get("models", [])))
+                label = f"{p['name']} ({count} models)"
+                desc = "current" if p.get("is_current") else None
+                options.append(
+                    discord.SelectOption(
+                        label=label[:100],
+                        value=p["slug"],
+                        description=desc,
+                    )
+                )
+            if not options:
+                return
+
+            select = discord.ui.Select(
+                placeholder="Choose a provider...",
+                options=options[:25],
+                custom_id="model_provider_select",
+            )
+            select.callback = self._on_provider_selected
+            self.add_item(select)
+
+            cancel_btn = discord.ui.Button(
+                label="Cancel", style=discord.ButtonStyle.red, custom_id="model_cancel"
+            )
+            cancel_btn.callback = self._on_cancel
+            self.add_item(cancel_btn)
+
+        def _build_model_select(self, provider_slug: str):
+            """Build the model dropdown for a specific provider."""
+            self.clear_items()
+            provider = next(
+                (p for p in self.providers if p["slug"] == provider_slug), None
+            )
+            if not provider:
+                return
+
+            models = provider.get("models", [])
+            options = []
+            for model_id in models[:25]:
+                short = model_id.split("/")[-1] if "/" in model_id else model_id
+                options.append(
+                    discord.SelectOption(
+                        label=short[:100],
+                        value=model_id[:100],
+                    )
+                )
+            if not options:
+                return
+
+            select = discord.ui.Select(
+                placeholder=f"Choose a model from {provider.get('name', provider_slug)}...",
+                options=options,
+                custom_id="model_model_select",
+            )
+            select.callback = self._on_model_selected
+            self.add_item(select)
+
+            back_btn = discord.ui.Button(
+                label="◀ Back", style=discord.ButtonStyle.grey, custom_id="model_back"
+            )
+            back_btn.callback = self._on_back
+            self.add_item(back_btn)
+
+            cancel_btn = discord.ui.Button(
+                label="Cancel", style=discord.ButtonStyle.red, custom_id="model_cancel2"
+            )
+            cancel_btn.callback = self._on_cancel
+            self.add_item(cancel_btn)
+
+        async def _on_provider_selected(self, interaction: discord.Interaction):
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized~", ephemeral=True
+                )
+                return
+
+            provider_slug = interaction.data["values"][0]
+            self._selected_provider = provider_slug
+            provider = next(
+                (p for p in self.providers if p["slug"] == provider_slug), None
+            )
+            pname = provider.get("name", provider_slug) if provider else provider_slug
+
+            self._build_model_select(provider_slug)
+
+            total = provider.get("total_models", 0) if provider else 0
+            shown = min(len(provider.get("models", [])), 25) if provider else 0
+            extra = f"\n*{total - shown} more available — type `/model <name>` directly*" if total > shown else ""
+
+            await interaction.response.edit_message(
+                embed=discord.Embed(
+                    title="⚙ Model Configuration",
+                    description=f"Provider: **{pname}**\nSelect a model:{extra}",
+                    color=discord.Color.blue(),
+                ),
+                view=self,
+            )
+
+        async def _on_model_selected(self, interaction: discord.Interaction):
+            if self.resolved:
+                await interaction.response.send_message(
+                    "Already resolved~", ephemeral=True
+                )
+                return
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized~", ephemeral=True
+                )
+                return
+
+            self.resolved = True
+            model_id = interaction.data["values"][0]
+
+            try:
+                result_text = await self.on_model_selected(
+                    str(interaction.channel_id),
+                    model_id,
+                    self._selected_provider,
+                )
+            except Exception as exc:
+                result_text = f"Error switching model: {exc}"
+
+            self.clear_items()
+            await interaction.response.edit_message(
+                embed=discord.Embed(
+                    title="⚙ Model Switched",
+                    description=result_text,
+                    color=discord.Color.green(),
+                ),
+                view=self,
+            )
+
+        async def _on_back(self, interaction: discord.Interaction):
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized~", ephemeral=True
+                )
+                return
+
+            self._build_provider_select()
+
+            try:
+                from hermes_cli.providers import get_label
+                provider_label = get_label(self.current_provider)
+            except Exception:
+                provider_label = self.current_provider
+
+            await interaction.response.edit_message(
+                embed=discord.Embed(
+                    title="⚙ Model Configuration",
+                    description=(
+                        f"Current model: `{self.current_model or 'unknown'}`\n"
+                        f"Provider: {provider_label}\n\n"
+                        f"Select a provider:"
+                    ),
+                    color=discord.Color.blue(),
+                ),
+                view=self,
+            )
+
+        async def _on_cancel(self, interaction: discord.Interaction):
+            self.resolved = True
+            self.clear_items()
+            await interaction.response.edit_message(
+                embed=discord.Embed(
+                    title="⚙ Model Configuration",
+                    description="Model selection cancelled.",
+                    color=discord.Color.greyple(),
+                ),
+                view=self,
+            )
+
+        async def on_timeout(self):
+            self.resolved = True
+            self.clear_items()

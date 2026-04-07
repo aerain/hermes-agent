@@ -37,8 +37,8 @@ hermes [global-options] <command> [subcommand/options]
 | `hermes gateway` | Run or manage the messaging gateway service. |
 | `hermes setup` | Interactive setup wizard for all or part of the configuration. |
 | `hermes whatsapp` | Configure and pair the WhatsApp bridge. |
-| `hermes login` / `logout` | Authenticate with OAuth-backed providers. |
-| `hermes auth` | Manage credential pools — add, list, remove, reset, set strategy. |
+| `hermes auth` | Manage credentials — add, list, remove, reset, set strategy. Handles OAuth flows for Codex/Nous/Anthropic. |
+| `hermes login` / `logout` | **Deprecated** — use `hermes auth` instead. |
 | `hermes status` | Show agent, auth, and platform status. |
 | `hermes cron` | Inspect and tick the cron scheduler. |
 | `hermes webhook` | Manage dynamic webhook subscriptions for event-driven activation. |
@@ -178,22 +178,11 @@ hermes whatsapp
 
 Runs the WhatsApp pairing/setup flow, including mode selection and QR-code pairing.
 
-## `hermes login` / `hermes logout`
+## `hermes login` / `hermes logout` *(Deprecated)*
 
-```bash
-hermes login [--provider nous|openai-codex] [--portal-url ...] [--inference-url ...]
-hermes logout [--provider nous|openai-codex]
-```
-
-`login` supports:
-- Nous Portal OAuth/device flow
-- OpenAI Codex OAuth/device flow
-
-Useful options for `login`:
-- `--no-browser`
-- `--timeout <seconds>`
-- `--ca-bundle <pem>`
-- `--insecure`
+:::caution
+`hermes login` has been removed. Use `hermes auth` to manage OAuth credentials, `hermes model` to select a provider, or `hermes setup` for full interactive setup.
+:::
 
 ## `hermes auth`
 
@@ -363,22 +352,30 @@ Notes:
 ## `hermes honcho`
 
 ```bash
-hermes honcho <subcommand>
+hermes honcho [--target-profile NAME] <subcommand>
 ```
+
+Manage Honcho cross-session memory integration. This command is provided by the Honcho memory provider plugin and is only available when `memory.provider` is set to `honcho` in your config.
+
+The `--target-profile` flag lets you manage another profile's Honcho config without switching to it.
 
 Subcommands:
 
 | Subcommand | Description |
 |------------|-------------|
-| `setup` | Interactive Honcho setup wizard. |
-| `status` | Show current Honcho config and connection status. |
+| `setup` | Redirects to `hermes memory setup` (unified setup path). |
+| `status [--all]` | Show current Honcho config and connection status. `--all` shows a cross-profile overview. |
+| `peers` | Show peer identities across all profiles. |
 | `sessions` | List known Honcho session mappings. |
-| `map` | Map the current directory to a Honcho session name. |
-| `peer` | Show or update peer names and dialectic reasoning level. |
-| `mode` | Show or set memory mode: `hybrid`, `honcho`, or `local`. |
-| `tokens` | Show or set token budgets for context and dialectic. |
-| `identity` | Seed or show the AI peer identity representation. |
-| `migrate` | Migration guide from openclaw-honcho to Hermes Honcho. |
+| `map [name]` | Map the current directory to a Honcho session name. Omit `name` to list current mappings. |
+| `peer` | Show or update peer names and dialectic reasoning level. Options: `--user NAME`, `--ai NAME`, `--reasoning LEVEL`. |
+| `mode [mode]` | Show or set recall mode: `hybrid`, `context`, or `tools`. Omit to show current. |
+| `tokens` | Show or set token budgets for context and dialectic. Options: `--context N`, `--dialectic N`. |
+| `identity [file] [--show]` | Seed or show the AI peer identity representation. |
+| `enable` | Enable Honcho for the active profile. |
+| `disable` | Disable Honcho for the active profile. |
+| `sync` | Sync Honcho config to all existing profiles (creates missing host blocks). |
+| `migrate` | Step-by-step migration guide from openclaw-honcho to Hermes Honcho. |
 
 ## `hermes memory`
 
@@ -386,7 +383,7 @@ Subcommands:
 hermes memory <subcommand>
 ```
 
-Set up and manage external memory provider plugins. Available providers: honcho, openviking, mem0, hindsight, holographic, retaindb, byterover. Only one external provider can be active at a time. Built-in memory (MEMORY.md/USER.md) is always active.
+Set up and manage external memory provider plugins. Available providers: honcho, openviking, mem0, hindsight, holographic, retaindb, byterover, supermemory. Only one external provider can be active at a time. Built-in memory (MEMORY.md/USER.md) is always active.
 
 Subcommands:
 

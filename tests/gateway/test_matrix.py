@@ -428,6 +428,7 @@ class TestMatrixRequirements:
     def test_check_requirements_with_token(self, monkeypatch):
         monkeypatch.setenv("MATRIX_ACCESS_TOKEN", "syt_test")
         monkeypatch.setenv("MATRIX_HOMESERVER", "https://matrix.example.org")
+        monkeypatch.delenv("MATRIX_ENCRYPTION", raising=False)
         from gateway.platforms.matrix import check_matrix_requirements
         try:
             import nio  # noqa: F401
@@ -447,6 +448,45 @@ class TestMatrixRequirements:
         monkeypatch.delenv("MATRIX_HOMESERVER", raising=False)
         from gateway.platforms.matrix import check_matrix_requirements
         assert check_matrix_requirements() is False
+
+    def test_check_requirements_encryption_true_no_e2ee_deps(self, monkeypatch):
+        """MATRIX_ENCRYPTION=true should fail if python-olm is not installed."""
+        monkeypatch.setenv("MATRIX_ACCESS_TOKEN", "syt_test")
+        monkeypatch.setenv("MATRIX_HOMESERVER", "https://matrix.example.org")
+        monkeypatch.setenv("MATRIX_ENCRYPTION", "true")
+
+        from gateway.platforms import matrix as matrix_mod
+        with patch.object(matrix_mod, "_check_e2ee_deps", return_value=False):
+            assert matrix_mod.check_matrix_requirements() is False
+
+    def test_check_requirements_encryption_false_no_e2ee_deps_ok(self, monkeypatch):
+        """Without encryption, missing E2EE deps should not block startup."""
+        monkeypatch.setenv("MATRIX_ACCESS_TOKEN", "syt_test")
+        monkeypatch.setenv("MATRIX_HOMESERVER", "https://matrix.example.org")
+        monkeypatch.delenv("MATRIX_ENCRYPTION", raising=False)
+
+        from gateway.platforms import matrix as matrix_mod
+        with patch.object(matrix_mod, "_check_e2ee_deps", return_value=False):
+            # Still needs nio itself to be importable
+            try:
+                import nio  # noqa: F401
+                assert matrix_mod.check_matrix_requirements() is True
+            except ImportError:
+                assert matrix_mod.check_matrix_requirements() is False
+
+    def test_check_requirements_encryption_true_with_e2ee_deps(self, monkeypatch):
+        """MATRIX_ENCRYPTION=true should pass if E2EE deps are available."""
+        monkeypatch.setenv("MATRIX_ACCESS_TOKEN", "syt_test")
+        monkeypatch.setenv("MATRIX_HOMESERVER", "https://matrix.example.org")
+        monkeypatch.setenv("MATRIX_ENCRYPTION", "true")
+
+        from gateway.platforms import matrix as matrix_mod
+        with patch.object(matrix_mod, "_check_e2ee_deps", return_value=True):
+            try:
+                import nio  # noqa: F401
+                assert matrix_mod.check_matrix_requirements() is True
+            except ImportError:
+                assert matrix_mod.check_matrix_requirements() is False
 
 
 # ---------------------------------------------------------------------------
@@ -516,10 +556,12 @@ class TestMatrixAccessTokenAuth:
         fake_nio.InviteMemberEvent = type("InviteMemberEvent", (), {})
         fake_nio.MegolmEvent = type("MegolmEvent", (), {})
 
-        with patch.dict("sys.modules", {"nio": fake_nio}):
-            with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
-                with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
-                    assert await adapter.connect() is True
+        from gateway.platforms import matrix as matrix_mod
+        with patch.object(matrix_mod, "_check_e2ee_deps", return_value=True):
+            with patch.dict("sys.modules", {"nio": fake_nio}):
+                with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
+                    with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                        assert await adapter.connect() is True
 
         fake_client.restore_login.assert_called_once_with(
             "@bot:example.org", "DEV123", "syt_test_access_token"
@@ -530,6 +572,326 @@ class TestMatrixAccessTokenAuth:
         fake_client.whoami.assert_awaited_once()
 
         await adapter.disconnect()
+
+
+class TestMatrixE2EEHardFail:
+    """connect() must refuse to start when E2EE is requested but deps are missing."""
+
+    @pytest.mark.asyncio
+    async def test_connect_fails_when_encryption_true_but_no_e2ee_deps(self):
+        from gateway.platforms.matrix import MatrixAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            token="syt_test_access_token",
+            extra={
+                "homeserver": "https://matrix.example.org",
+                "user_id": "@bot:example.org",
+                "encryption": True,
+            },
+        )
+        adapter = MatrixAdapter(config)
+
+        fake_nio = MagicMock()
+        fake_nio.AsyncClient = MagicMock()
+
+        from gateway.platforms import matrix as matrix_mod
+        with patch.object(matrix_mod, "_check_e2ee_deps", return_value=False):
+            with patch.dict("sys.modules", {"nio": fake_nio}):
+                result = await adapter.connect()
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_connect_fails_when_olm_not_loaded_after_login(self):
+        """Even if _check_e2ee_deps passes, if olm is None after auth, hard-fail."""
+        from gateway.platforms.matrix import MatrixAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            token="syt_test_access_token",
+            extra={
+                "homeserver": "https://matrix.example.org",
+                "user_id": "@bot:example.org",
+                "encryption": True,
+            },
+        )
+        adapter = MatrixAdapter(config)
+
+        class FakeWhoamiResponse:
+            def __init__(self, user_id, device_id):
+                self.user_id = user_id
+                self.device_id = device_id
+
+        fake_client = MagicMock()
+        fake_client.whoami = AsyncMock(return_value=FakeWhoamiResponse("@bot:example.org", "DEV123"))
+        fake_client.close = AsyncMock()
+        # olm is None — crypto store not loaded
+        fake_client.olm = None
+        fake_client.should_upload_keys = False
+
+        def _restore_login(user_id, device_id, access_token):
+            fake_client.user_id = user_id
+            fake_client.device_id = device_id
+            fake_client.access_token = access_token
+
+        fake_client.restore_login = MagicMock(side_effect=_restore_login)
+
+        fake_nio = MagicMock()
+        fake_nio.AsyncClient = MagicMock(return_value=fake_client)
+        fake_nio.WhoamiResponse = FakeWhoamiResponse
+
+        from gateway.platforms import matrix as matrix_mod
+        with patch.object(matrix_mod, "_check_e2ee_deps", return_value=True):
+            with patch.dict("sys.modules", {"nio": fake_nio}):
+                result = await adapter.connect()
+
+        assert result is False
+        fake_client.close.assert_awaited_once()
+
+
+class TestMatrixDeviceId:
+    """MATRIX_DEVICE_ID should be used for stable device identity."""
+
+    def test_device_id_from_config_extra(self):
+        from gateway.platforms.matrix import MatrixAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            token="syt_test",
+            extra={
+                "homeserver": "https://matrix.example.org",
+                "device_id": "HERMES_BOT_STABLE",
+            },
+        )
+        adapter = MatrixAdapter(config)
+        assert adapter._device_id == "HERMES_BOT_STABLE"
+
+    def test_device_id_from_env(self, monkeypatch):
+        monkeypatch.setenv("MATRIX_DEVICE_ID", "FROM_ENV")
+
+        from gateway.platforms.matrix import MatrixAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            token="syt_test",
+            extra={
+                "homeserver": "https://matrix.example.org",
+            },
+        )
+        adapter = MatrixAdapter(config)
+        assert adapter._device_id == "FROM_ENV"
+
+    def test_device_id_config_takes_precedence_over_env(self, monkeypatch):
+        monkeypatch.setenv("MATRIX_DEVICE_ID", "FROM_ENV")
+
+        from gateway.platforms.matrix import MatrixAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            token="syt_test",
+            extra={
+                "homeserver": "https://matrix.example.org",
+                "device_id": "FROM_CONFIG",
+            },
+        )
+        adapter = MatrixAdapter(config)
+        assert adapter._device_id == "FROM_CONFIG"
+
+    @pytest.mark.asyncio
+    async def test_connect_uses_configured_device_id_over_whoami(self):
+        """When MATRIX_DEVICE_ID is set, it should be used instead of whoami device_id."""
+        from gateway.platforms.matrix import MatrixAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            token="syt_test_access_token",
+            extra={
+                "homeserver": "https://matrix.example.org",
+                "user_id": "@bot:example.org",
+                "encryption": True,
+                "device_id": "MY_STABLE_DEVICE",
+            },
+        )
+        adapter = MatrixAdapter(config)
+
+        class FakeWhoamiResponse:
+            def __init__(self, user_id, device_id):
+                self.user_id = user_id
+                self.device_id = device_id
+
+        class FakeSyncResponse:
+            def __init__(self):
+                self.rooms = MagicMock(join={})
+
+        fake_client = MagicMock()
+        fake_client.whoami = AsyncMock(return_value=FakeWhoamiResponse("@bot:example.org", "WHOAMI_DEV"))
+        fake_client.sync = AsyncMock(return_value=FakeSyncResponse())
+        fake_client.keys_upload = AsyncMock()
+        fake_client.keys_query = AsyncMock()
+        fake_client.keys_claim = AsyncMock()
+        fake_client.send_to_device_messages = AsyncMock(return_value=[])
+        fake_client.get_users_for_key_claiming = MagicMock(return_value={})
+        fake_client.close = AsyncMock()
+        fake_client.add_event_callback = MagicMock()
+        fake_client.rooms = {}
+        fake_client.account_data = {}
+        fake_client.olm = object()
+        fake_client.should_upload_keys = False
+        fake_client.should_query_keys = False
+        fake_client.should_claim_keys = False
+
+        def _restore_login(user_id, device_id, access_token):
+            fake_client.user_id = user_id
+            fake_client.device_id = device_id
+            fake_client.access_token = access_token
+
+        fake_client.restore_login = MagicMock(side_effect=_restore_login)
+
+        fake_nio = MagicMock()
+        fake_nio.AsyncClient = MagicMock(return_value=fake_client)
+        fake_nio.WhoamiResponse = FakeWhoamiResponse
+        fake_nio.SyncResponse = FakeSyncResponse
+        fake_nio.LoginResponse = type("LoginResponse", (), {})
+        fake_nio.RoomMessageText = type("RoomMessageText", (), {})
+        fake_nio.RoomMessageImage = type("RoomMessageImage", (), {})
+        fake_nio.RoomMessageAudio = type("RoomMessageAudio", (), {})
+        fake_nio.RoomMessageVideo = type("RoomMessageVideo", (), {})
+        fake_nio.RoomMessageFile = type("RoomMessageFile", (), {})
+        fake_nio.InviteMemberEvent = type("InviteMemberEvent", (), {})
+        fake_nio.MegolmEvent = type("MegolmEvent", (), {})
+
+        from gateway.platforms import matrix as matrix_mod
+        with patch.object(matrix_mod, "_check_e2ee_deps", return_value=True):
+            with patch.dict("sys.modules", {"nio": fake_nio}):
+                with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
+                    with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                        assert await adapter.connect() is True
+
+        # The configured device_id should override the whoami device_id
+        fake_client.restore_login.assert_called_once_with(
+            "@bot:example.org", "MY_STABLE_DEVICE", "syt_test_access_token"
+        )
+        assert fake_client.device_id == "MY_STABLE_DEVICE"
+
+        # Verify device_id was passed to nio.AsyncClient constructor
+        ctor_call = fake_nio.AsyncClient.call_args
+        assert ctor_call.kwargs.get("device_id") == "MY_STABLE_DEVICE"
+
+        await adapter.disconnect()
+
+
+class TestMatrixE2EEClientConstructorFailure:
+    """connect() should hard-fail if nio.AsyncClient() raises when encryption is on."""
+
+    @pytest.mark.asyncio
+    async def test_connect_fails_when_e2ee_client_constructor_raises(self):
+        from gateway.platforms.matrix import MatrixAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            token="syt_test_access_token",
+            extra={
+                "homeserver": "https://matrix.example.org",
+                "user_id": "@bot:example.org",
+                "encryption": True,
+            },
+        )
+        adapter = MatrixAdapter(config)
+
+        fake_nio = MagicMock()
+        fake_nio.AsyncClient = MagicMock(side_effect=Exception("olm init failed"))
+
+        from gateway.platforms import matrix as matrix_mod
+        with patch.object(matrix_mod, "_check_e2ee_deps", return_value=True):
+            with patch.dict("sys.modules", {"nio": fake_nio}):
+                result = await adapter.connect()
+
+        assert result is False
+
+
+class TestMatrixPasswordLoginDeviceId:
+    """MATRIX_DEVICE_ID should be passed to nio.AsyncClient even with password login."""
+
+    @pytest.mark.asyncio
+    async def test_password_login_passes_device_id_to_constructor(self):
+        from gateway.platforms.matrix import MatrixAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            extra={
+                "homeserver": "https://matrix.example.org",
+                "user_id": "@bot:example.org",
+                "password": "secret",
+                "device_id": "STABLE_PW_DEVICE",
+            },
+        )
+        adapter = MatrixAdapter(config)
+
+        class FakeLoginResponse:
+            pass
+
+        class FakeSyncResponse:
+            def __init__(self):
+                self.rooms = MagicMock(join={})
+
+        fake_client = MagicMock()
+        fake_client.login = AsyncMock(return_value=FakeLoginResponse())
+        fake_client.sync = AsyncMock(return_value=FakeSyncResponse())
+        fake_client.close = AsyncMock()
+        fake_client.add_event_callback = MagicMock()
+        fake_client.rooms = {}
+        fake_client.account_data = {}
+
+        fake_nio = MagicMock()
+        fake_nio.AsyncClient = MagicMock(return_value=fake_client)
+        fake_nio.LoginResponse = FakeLoginResponse
+        fake_nio.SyncResponse = FakeSyncResponse
+        fake_nio.RoomMessageText = type("RoomMessageText", (), {})
+        fake_nio.RoomMessageImage = type("RoomMessageImage", (), {})
+        fake_nio.RoomMessageAudio = type("RoomMessageAudio", (), {})
+        fake_nio.RoomMessageVideo = type("RoomMessageVideo", (), {})
+        fake_nio.RoomMessageFile = type("RoomMessageFile", (), {})
+        fake_nio.InviteMemberEvent = type("InviteMemberEvent", (), {})
+
+        with patch.dict("sys.modules", {"nio": fake_nio}):
+            with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
+                with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                    assert await adapter.connect() is True
+
+        # Verify device_id was passed to the nio.AsyncClient constructor
+        ctor_call = fake_nio.AsyncClient.call_args
+        assert ctor_call.kwargs.get("device_id") == "STABLE_PW_DEVICE"
+
+        await adapter.disconnect()
+
+
+class TestMatrixDeviceIdConfig:
+    """MATRIX_DEVICE_ID should be plumbed through gateway config."""
+
+    def test_device_id_in_config_extra(self, monkeypatch):
+        monkeypatch.setenv("MATRIX_ACCESS_TOKEN", "syt_abc123")
+        monkeypatch.setenv("MATRIX_HOMESERVER", "https://matrix.example.org")
+        monkeypatch.setenv("MATRIX_DEVICE_ID", "HERMES_BOT")
+
+        from gateway.config import GatewayConfig, _apply_env_overrides
+        config = GatewayConfig()
+        _apply_env_overrides(config)
+
+        mc = config.platforms[Platform.MATRIX]
+        assert mc.extra.get("device_id") == "HERMES_BOT"
+
+    def test_device_id_not_set_when_env_empty(self, monkeypatch):
+        monkeypatch.setenv("MATRIX_ACCESS_TOKEN", "syt_abc123")
+        monkeypatch.setenv("MATRIX_HOMESERVER", "https://matrix.example.org")
+        monkeypatch.delenv("MATRIX_DEVICE_ID", raising=False)
+
+        from gateway.config import GatewayConfig, _apply_env_overrides
+        config = GatewayConfig()
+        _apply_env_overrides(config)
+
+        mc = config.platforms[Platform.MATRIX]
+        assert "device_id" not in mc.extra
 
 
 class TestMatrixE2EEMaintenance:
@@ -993,3 +1355,778 @@ class TestMatrixKeyExportImport:
         # Should not have tried to export
         assert not hasattr(fake_client, "export_keys") or \
                not fake_client.export_keys.called
+
+
+# ---------------------------------------------------------------------------
+# E2EE: Encrypted media
+# ---------------------------------------------------------------------------
+
+class TestMatrixEncryptedMedia:
+    @pytest.mark.asyncio
+    async def test_connect_registers_callbacks_for_encrypted_media_events(self):
+        from gateway.platforms.matrix import MatrixAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            token="syt_te...oken",
+            extra={
+                "homeserver": "https://matrix.example.org",
+                "user_id": "@bot:example.org",
+                "encryption": True,
+            },
+        )
+        adapter = MatrixAdapter(config)
+
+        class FakeWhoamiResponse:
+            def __init__(self, user_id, device_id):
+                self.user_id = user_id
+                self.device_id = device_id
+
+        class FakeSyncResponse:
+            def __init__(self):
+                self.rooms = MagicMock(join={})
+
+        class FakeRoomMessageText: ...
+        class FakeRoomMessageImage: ...
+        class FakeRoomMessageAudio: ...
+        class FakeRoomMessageVideo: ...
+        class FakeRoomMessageFile: ...
+        class FakeRoomEncryptedImage: ...
+        class FakeRoomEncryptedAudio: ...
+        class FakeRoomEncryptedVideo: ...
+        class FakeRoomEncryptedFile: ...
+        class FakeInviteMemberEvent: ...
+        class FakeMegolmEvent: ...
+
+        fake_client = MagicMock()
+        fake_client.whoami = AsyncMock(return_value=FakeWhoamiResponse("@bot:example.org", "DEV123"))
+        fake_client.sync = AsyncMock(return_value=FakeSyncResponse())
+        fake_client.keys_upload = AsyncMock()
+        fake_client.keys_query = AsyncMock()
+        fake_client.keys_claim = AsyncMock()
+        fake_client.send_to_device_messages = AsyncMock(return_value=[])
+        fake_client.get_users_for_key_claiming = MagicMock(return_value={})
+        fake_client.close = AsyncMock()
+        fake_client.add_event_callback = MagicMock()
+        fake_client.rooms = {}
+        fake_client.account_data = {}
+        fake_client.olm = object()
+        fake_client.should_upload_keys = False
+        fake_client.should_query_keys = False
+        fake_client.should_claim_keys = False
+        fake_client.restore_login = MagicMock(side_effect=lambda u, d, t: None)
+
+        fake_nio = MagicMock()
+        fake_nio.AsyncClient = MagicMock(return_value=fake_client)
+        fake_nio.WhoamiResponse = FakeWhoamiResponse
+        fake_nio.SyncResponse = FakeSyncResponse
+        fake_nio.LoginResponse = type("LoginResponse", (), {})
+        fake_nio.RoomMessageText = FakeRoomMessageText
+        fake_nio.RoomMessageImage = FakeRoomMessageImage
+        fake_nio.RoomMessageAudio = FakeRoomMessageAudio
+        fake_nio.RoomMessageVideo = FakeRoomMessageVideo
+        fake_nio.RoomMessageFile = FakeRoomMessageFile
+        fake_nio.RoomEncryptedImage = FakeRoomEncryptedImage
+        fake_nio.RoomEncryptedAudio = FakeRoomEncryptedAudio
+        fake_nio.RoomEncryptedVideo = FakeRoomEncryptedVideo
+        fake_nio.RoomEncryptedFile = FakeRoomEncryptedFile
+        fake_nio.InviteMemberEvent = FakeInviteMemberEvent
+        fake_nio.MegolmEvent = FakeMegolmEvent
+
+        from gateway.platforms import matrix as matrix_mod
+        with patch.object(matrix_mod, "_check_e2ee_deps", return_value=True):
+            with patch.dict("sys.modules", {"nio": fake_nio}):
+                with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
+                    with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                        assert await adapter.connect() is True
+
+        callback_classes = [call.args[1] for call in fake_client.add_event_callback.call_args_list]
+        assert FakeRoomEncryptedImage in callback_classes
+        assert FakeRoomEncryptedAudio in callback_classes
+        assert FakeRoomEncryptedVideo in callback_classes
+        assert FakeRoomEncryptedFile in callback_classes
+
+        await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_on_room_message_media_decrypts_encrypted_image_and_passes_local_path(self):
+        from nio.crypto.attachments import encrypt_attachment
+
+        adapter = _make_adapter()
+        adapter._user_id = "@bot:example.org"
+        adapter._startup_ts = 0.0
+        adapter._dm_rooms = {}
+        adapter.handle_message = AsyncMock()
+
+        plaintext = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+        ciphertext, keys = encrypt_attachment(plaintext)
+
+        class FakeRoomEncryptedImage:
+            def __init__(self):
+                self.sender = "@alice:example.org"
+                self.event_id = "$img1"
+                self.server_timestamp = 0
+                self.body = "screenshot.png"
+                self.url = "mxc://example.org/media123"
+                self.key = keys["key"]["k"]
+                self.hashes = keys["hashes"]
+                self.iv = keys["iv"]
+                self.mimetype = "image/png"
+                self.source = {
+                    "content": {
+                        "body": "screenshot.png",
+                        "info": {"mimetype": "image/png"},
+                        "file": {
+                            "url": self.url,
+                            "key": keys["key"],
+                            "hashes": keys["hashes"],
+                            "iv": keys["iv"],
+                        },
+                    }
+                }
+
+        class FakeDownloadResponse:
+            def __init__(self, body):
+                self.body = body
+
+        fake_client = MagicMock()
+        fake_client.download = AsyncMock(return_value=FakeDownloadResponse(ciphertext))
+        adapter._client = fake_client
+
+        fake_nio = MagicMock()
+        fake_nio.RoomMessageImage = type("RoomMessageImage", (), {})
+        fake_nio.RoomMessageAudio = type("RoomMessageAudio", (), {})
+        fake_nio.RoomMessageVideo = type("RoomMessageVideo", (), {})
+        fake_nio.RoomMessageFile = type("RoomMessageFile", (), {})
+        fake_nio.RoomEncryptedImage = FakeRoomEncryptedImage
+        fake_nio.RoomEncryptedAudio = type("RoomEncryptedAudio", (), {})
+        fake_nio.RoomEncryptedVideo = type("RoomEncryptedVideo", (), {})
+        fake_nio.RoomEncryptedFile = type("RoomEncryptedFile", (), {})
+
+        room = MagicMock(room_id="!room:example.org", member_count=2, users={})
+        event = FakeRoomEncryptedImage()
+
+        with patch.dict("sys.modules", {"nio": fake_nio}):
+            with patch("gateway.platforms.base.cache_image_from_bytes", return_value="/tmp/cached-image.png") as cache_mock:
+                await adapter._on_room_message_media(room, event)
+
+        cache_mock.assert_called_once_with(plaintext, ext=".png")
+        msg_event = adapter.handle_message.await_args.args[0]
+        assert msg_event.message_type.name == "PHOTO"
+        assert msg_event.media_urls == ["/tmp/cached-image.png"]
+        assert msg_event.media_types == ["image/png"]
+
+    @pytest.mark.asyncio
+    async def test_on_room_message_media_decrypts_encrypted_voice_and_caches_audio(self):
+        from nio.crypto.attachments import encrypt_attachment
+
+        adapter = _make_adapter()
+        adapter._user_id = "@bot:example.org"
+        adapter._startup_ts = 0.0
+        adapter._dm_rooms = {}
+        adapter.handle_message = AsyncMock()
+
+        plaintext = b"OggS" + b"\x00" * 32
+        ciphertext, keys = encrypt_attachment(plaintext)
+
+        class FakeRoomEncryptedAudio:
+            def __init__(self):
+                self.sender = "@alice:example.org"
+                self.event_id = "$voice1"
+                self.server_timestamp = 0
+                self.body = "voice.ogg"
+                self.url = "mxc://example.org/voice123"
+                self.key = keys["key"]["k"]
+                self.hashes = keys["hashes"]
+                self.iv = keys["iv"]
+                self.mimetype = "audio/ogg"
+                self.source = {
+                    "content": {
+                        "body": "voice.ogg",
+                        "info": {"mimetype": "audio/ogg"},
+                        "org.matrix.msc3245.voice": {},
+                        "file": {
+                            "url": self.url,
+                            "key": keys["key"],
+                            "hashes": keys["hashes"],
+                            "iv": keys["iv"],
+                        },
+                    }
+                }
+
+        class FakeDownloadResponse:
+            def __init__(self, body):
+                self.body = body
+
+        fake_client = MagicMock()
+        fake_client.download = AsyncMock(return_value=FakeDownloadResponse(ciphertext))
+        adapter._client = fake_client
+
+        fake_nio = MagicMock()
+        fake_nio.RoomMessageImage = type("RoomMessageImage", (), {})
+        fake_nio.RoomMessageAudio = type("RoomMessageAudio", (), {})
+        fake_nio.RoomMessageVideo = type("RoomMessageVideo", (), {})
+        fake_nio.RoomMessageFile = type("RoomMessageFile", (), {})
+        fake_nio.RoomEncryptedImage = type("RoomEncryptedImage", (), {})
+        fake_nio.RoomEncryptedAudio = FakeRoomEncryptedAudio
+        fake_nio.RoomEncryptedVideo = type("RoomEncryptedVideo", (), {})
+        fake_nio.RoomEncryptedFile = type("RoomEncryptedFile", (), {})
+
+        room = MagicMock(room_id="!room:example.org", member_count=2, users={})
+        event = FakeRoomEncryptedAudio()
+
+        with patch.dict("sys.modules", {"nio": fake_nio}):
+            with patch("gateway.platforms.base.cache_audio_from_bytes", return_value="/tmp/cached-voice.ogg") as cache_mock:
+                await adapter._on_room_message_media(room, event)
+
+        cache_mock.assert_called_once_with(plaintext, ext=".ogg")
+        msg_event = adapter.handle_message.await_args.args[0]
+        assert msg_event.message_type.name == "VOICE"
+        assert msg_event.media_urls == ["/tmp/cached-voice.ogg"]
+        assert msg_event.media_types == ["audio/ogg"]
+
+    @pytest.mark.asyncio
+    async def test_on_room_message_media_decrypts_encrypted_file_and_caches_document(self):
+        from nio.crypto.attachments import encrypt_attachment
+
+        adapter = _make_adapter()
+        adapter._user_id = "@bot:example.org"
+        adapter._startup_ts = 0.0
+        adapter._dm_rooms = {}
+        adapter.handle_message = AsyncMock()
+
+        plaintext = b"hello from encrypted document"
+        ciphertext, keys = encrypt_attachment(plaintext)
+
+        class FakeRoomEncryptedFile:
+            def __init__(self):
+                self.sender = "@alice:example.org"
+                self.event_id = "$file1"
+                self.server_timestamp = 0
+                self.body = "notes.txt"
+                self.url = "mxc://example.org/file123"
+                self.key = keys["key"]
+                self.hashes = keys["hashes"]
+                self.iv = keys["iv"]
+                self.mimetype = "text/plain"
+                self.source = {
+                    "content": {
+                        "body": "notes.txt",
+                        "info": {"mimetype": "text/plain"},
+                        "file": {
+                            "url": self.url,
+                            "key": keys["key"],
+                            "hashes": keys["hashes"],
+                            "iv": keys["iv"],
+                        },
+                    }
+                }
+
+        class FakeDownloadResponse:
+            def __init__(self, body):
+                self.body = body
+
+        fake_client = MagicMock()
+        fake_client.download = AsyncMock(return_value=FakeDownloadResponse(ciphertext))
+        adapter._client = fake_client
+
+        fake_nio = MagicMock()
+        fake_nio.RoomMessageImage = type("RoomMessageImage", (), {})
+        fake_nio.RoomMessageAudio = type("RoomMessageAudio", (), {})
+        fake_nio.RoomMessageVideo = type("RoomMessageVideo", (), {})
+        fake_nio.RoomMessageFile = type("RoomMessageFile", (), {})
+        fake_nio.RoomEncryptedImage = type("RoomEncryptedImage", (), {})
+        fake_nio.RoomEncryptedAudio = type("RoomEncryptedAudio", (), {})
+        fake_nio.RoomEncryptedVideo = type("RoomEncryptedVideo", (), {})
+        fake_nio.RoomEncryptedFile = FakeRoomEncryptedFile
+
+        room = MagicMock(room_id="!room:example.org", member_count=2, users={})
+        event = FakeRoomEncryptedFile()
+
+        with patch.dict("sys.modules", {"nio": fake_nio}):
+            with patch("gateway.platforms.base.cache_document_from_bytes", return_value="/tmp/cached-notes.txt") as cache_mock:
+                await adapter._on_room_message_media(room, event)
+
+        cache_mock.assert_called_once_with(plaintext, "notes.txt")
+        msg_event = adapter.handle_message.await_args.args[0]
+        assert msg_event.message_type.name == "DOCUMENT"
+        assert msg_event.media_urls == ["/tmp/cached-notes.txt"]
+        assert msg_event.media_types == ["text/plain"]
+
+    @pytest.mark.asyncio
+    async def test_on_room_message_media_does_not_emit_ciphertext_url_when_encrypted_media_decryption_fails(self):
+        adapter = _make_adapter()
+        adapter._user_id = "@bot:example.org"
+        adapter._startup_ts = 0.0
+        adapter._dm_rooms = {}
+        adapter.handle_message = AsyncMock()
+
+        class FakeRoomEncryptedImage:
+            def __init__(self):
+                self.sender = "@alice:example.org"
+                self.event_id = "$img2"
+                self.server_timestamp = 0
+                self.body = "broken.png"
+                self.url = "mxc://example.org/media999"
+                self.key = {"k": "broken"}
+                self.hashes = {"sha256": "broken"}
+                self.iv = "broken"
+                self.mimetype = "image/png"
+                self.source = {
+                    "content": {
+                        "body": "broken.png",
+                        "info": {"mimetype": "image/png"},
+                        "file": {
+                            "url": self.url,
+                            "key": self.key,
+                            "hashes": self.hashes,
+                            "iv": self.iv,
+                        },
+                    }
+                }
+
+        class FakeDownloadResponse:
+            def __init__(self, body):
+                self.body = body
+
+        fake_client = MagicMock()
+        fake_client.download = AsyncMock(return_value=FakeDownloadResponse(b"ciphertext"))
+        adapter._client = fake_client
+
+        fake_nio = MagicMock()
+        fake_nio.RoomMessageImage = type("RoomMessageImage", (), {})
+        fake_nio.RoomMessageAudio = type("RoomMessageAudio", (), {})
+        fake_nio.RoomMessageVideo = type("RoomMessageVideo", (), {})
+        fake_nio.RoomMessageFile = type("RoomMessageFile", (), {})
+        fake_nio.RoomEncryptedImage = FakeRoomEncryptedImage
+        fake_nio.RoomEncryptedAudio = type("RoomEncryptedAudio", (), {})
+        fake_nio.RoomEncryptedVideo = type("RoomEncryptedVideo", (), {})
+        fake_nio.RoomEncryptedFile = type("RoomEncryptedFile", (), {})
+
+        room = MagicMock(room_id="!room:example.org", member_count=2, users={})
+        event = FakeRoomEncryptedImage()
+
+        with patch.dict("sys.modules", {"nio": fake_nio}):
+            await adapter._on_room_message_media(room, event)
+
+        msg_event = adapter.handle_message.await_args.args[0]
+        assert not msg_event.media_urls
+        assert not msg_event.media_types
+
+
+# ---------------------------------------------------------------------------
+# Markdown to HTML: security tests
+# ---------------------------------------------------------------------------
+
+class TestMatrixMarkdownHtmlSecurity:
+    """Tests for HTML injection prevention in _markdown_to_html_fallback."""
+
+    def setup_method(self):
+        from gateway.platforms.matrix import MatrixAdapter
+        self.convert = MatrixAdapter._markdown_to_html_fallback
+
+    def test_script_injection_in_header(self):
+        result = self.convert("# <script>alert(1)</script>")
+        assert "<script>" not in result
+        assert "&lt;script&gt;" in result
+
+    def test_script_injection_in_plain_text(self):
+        result = self.convert("Hello <script>alert(1)</script>")
+        assert "<script>" not in result
+
+    def test_img_onerror_in_blockquote(self):
+        result = self.convert('> <img onerror="alert(1)">')
+        assert "onerror" not in result or "&lt;img" in result
+
+    def test_script_in_list_item(self):
+        result = self.convert("- <script>alert(1)</script>")
+        assert "<script>" not in result
+
+    def test_script_in_ordered_list(self):
+        result = self.convert("1. <script>alert(1)</script>")
+        assert "<script>" not in result
+
+    def test_javascript_uri_blocked(self):
+        result = self.convert("[click](javascript:alert(1))")
+        assert 'href="javascript:' not in result
+
+    def test_data_uri_blocked(self):
+        result = self.convert("[click](data:text/html,<script>)")
+        assert 'href="data:' not in result
+
+    def test_vbscript_uri_blocked(self):
+        result = self.convert("[click](vbscript:alert(1))")
+        assert 'href="vbscript:' not in result
+
+    def test_link_text_html_injection(self):
+        result = self.convert('[<img onerror="x">](http://safe.com)')
+        assert "<img" not in result or "&lt;img" in result
+
+    def test_link_href_attribute_breakout(self):
+        result = self.convert('[link](http://x" onclick="alert(1))')
+        assert "onclick" not in result or "&quot;" in result
+
+    def test_html_injection_in_bold(self):
+        result = self.convert("**<img onerror=alert(1)>**")
+        assert "<img" not in result or "&lt;img" in result
+
+    def test_html_injection_in_italic(self):
+        result = self.convert("*<script>alert(1)</script>*")
+        assert "<script>" not in result
+
+
+# ---------------------------------------------------------------------------
+# Markdown to HTML: extended formatting tests
+# ---------------------------------------------------------------------------
+
+class TestMatrixMarkdownHtmlFormatting:
+    """Tests for new formatting capabilities in _markdown_to_html_fallback."""
+
+    def setup_method(self):
+        from gateway.platforms.matrix import MatrixAdapter
+        self.convert = MatrixAdapter._markdown_to_html_fallback
+
+    def test_fenced_code_block(self):
+        result = self.convert('```python\ndef hello():\n    pass\n```')
+        assert "<pre><code" in result
+        assert "language-python" in result
+
+    def test_fenced_code_block_no_lang(self):
+        result = self.convert('```\nsome code\n```')
+        assert "<pre><code>" in result
+
+    def test_code_block_html_escaped(self):
+        result = self.convert('```\n<script>alert(1)</script>\n```')
+        assert "&lt;script&gt;" in result
+        assert "<script>" not in result
+
+    def test_headers(self):
+        assert "<h1>" in self.convert("# H1")
+        assert "<h2>" in self.convert("## H2")
+        assert "<h3>" in self.convert("### H3")
+
+    def test_unordered_list(self):
+        result = self.convert("- One\n- Two\n- Three")
+        assert "<ul>" in result
+        assert result.count("<li>") == 3
+
+    def test_ordered_list(self):
+        result = self.convert("1. First\n2. Second")
+        assert "<ol>" in result
+        assert result.count("<li>") == 2
+
+    def test_blockquote(self):
+        result = self.convert("> A quote\n> continued")
+        assert "<blockquote>" in result
+        assert "A quote" in result
+
+    def test_horizontal_rule(self):
+        assert "<hr>" in self.convert("---")
+        assert "<hr>" in self.convert("***")
+
+    def test_strikethrough(self):
+        result = self.convert("~~deleted~~")
+        assert "<del>deleted</del>" in result
+
+    def test_links_preserved(self):
+        result = self.convert("[text](https://example.com)")
+        assert '<a href="https://example.com">text</a>' in result
+
+    def test_complex_mixed_document(self):
+        """A realistic agent response with multiple formatting types."""
+        text = "## Summary\n\nHere's what I found:\n\n- **Bold item**\n- `code` item\n\n```bash\necho hello\n```\n\n1. Step one\n2. Step two"
+        result = self.convert(text)
+        assert "<h2>" in result
+        assert "<strong>" in result
+        assert "<code>" in result
+        assert "<ul>" in result
+        assert "<ol>" in result
+        assert "<pre><code" in result
+
+
+# ---------------------------------------------------------------------------
+# Link URL sanitization
+# ---------------------------------------------------------------------------
+
+class TestMatrixLinkSanitization:
+    def test_safe_https_url(self):
+        from gateway.platforms.matrix import MatrixAdapter
+        assert MatrixAdapter._sanitize_link_url("https://example.com") == "https://example.com"
+
+    def test_javascript_blocked(self):
+        from gateway.platforms.matrix import MatrixAdapter
+        assert MatrixAdapter._sanitize_link_url("javascript:alert(1)") == ""
+
+    def test_data_blocked(self):
+        from gateway.platforms.matrix import MatrixAdapter
+        assert MatrixAdapter._sanitize_link_url("data:text/html,bad") == ""
+
+    def test_vbscript_blocked(self):
+        from gateway.platforms.matrix import MatrixAdapter
+        assert MatrixAdapter._sanitize_link_url("vbscript:bad") == ""
+
+    def test_quotes_escaped(self):
+        from gateway.platforms.matrix import MatrixAdapter
+        result = MatrixAdapter._sanitize_link_url('http://x"y')
+        assert '"' not in result
+        assert "&quot;" in result
+
+
+# ---------------------------------------------------------------------------
+# Reactions
+# ---------------------------------------------------------------------------
+
+class TestMatrixReactions:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+
+    @pytest.mark.asyncio
+    async def test_send_reaction(self):
+        """_send_reaction should call room_send with m.reaction."""
+        nio = pytest.importorskip("nio")
+        mock_client = MagicMock()
+        mock_client.room_send = AsyncMock(
+            return_value=MagicMock(spec=nio.RoomSendResponse)
+        )
+        self.adapter._client = mock_client
+
+        result = await self.adapter._send_reaction("!room:ex", "$event1", "👍")
+        assert result is True
+        mock_client.room_send.assert_called_once()
+        args = mock_client.room_send.call_args
+        assert args[0][1] == "m.reaction"
+        content = args[0][2]
+        assert content["m.relates_to"]["rel_type"] == "m.annotation"
+        assert content["m.relates_to"]["key"] == "👍"
+
+    @pytest.mark.asyncio
+    async def test_send_reaction_no_client(self):
+        self.adapter._client = None
+        result = await self.adapter._send_reaction("!room:ex", "$ev", "👍")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_on_processing_start_sends_eyes(self):
+        """on_processing_start should send 👀 reaction."""
+        from gateway.platforms.base import MessageEvent, MessageType
+
+        self.adapter._reactions_enabled = True
+        self.adapter._send_reaction = AsyncMock(return_value=True)
+
+        source = MagicMock()
+        source.chat_id = "!room:ex"
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={},
+            message_id="$msg1",
+        )
+        await self.adapter.on_processing_start(event)
+        self.adapter._send_reaction.assert_called_once_with("!room:ex", "$msg1", "👀")
+
+    @pytest.mark.asyncio
+    async def test_on_processing_complete_sends_check(self):
+        from gateway.platforms.base import MessageEvent, MessageType
+
+        self.adapter._reactions_enabled = True
+        self.adapter._send_reaction = AsyncMock(return_value=True)
+
+        source = MagicMock()
+        source.chat_id = "!room:ex"
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={},
+            message_id="$msg1",
+        )
+        await self.adapter.on_processing_complete(event, success=True)
+        self.adapter._send_reaction.assert_called_once_with("!room:ex", "$msg1", "✅")
+
+    @pytest.mark.asyncio
+    async def test_reactions_disabled(self):
+        from gateway.platforms.base import MessageEvent, MessageType
+
+        self.adapter._reactions_enabled = False
+        self.adapter._send_reaction = AsyncMock()
+
+        source = MagicMock()
+        source.chat_id = "!room:ex"
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={},
+            message_id="$msg1",
+        )
+        await self.adapter.on_processing_start(event)
+        self.adapter._send_reaction.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Read receipts
+# ---------------------------------------------------------------------------
+
+class TestMatrixReadReceipts:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+
+    @pytest.mark.asyncio
+    async def test_send_read_receipt(self):
+        mock_client = MagicMock()
+        mock_client.room_read_markers = AsyncMock(return_value=MagicMock())
+        self.adapter._client = mock_client
+
+        result = await self.adapter.send_read_receipt("!room:ex", "$event1")
+        assert result is True
+        mock_client.room_read_markers.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_read_receipt_no_client(self):
+        self.adapter._client = None
+        result = await self.adapter.send_read_receipt("!room:ex", "$event1")
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Message redaction
+# ---------------------------------------------------------------------------
+
+class TestMatrixRedaction:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+
+    @pytest.mark.asyncio
+    async def test_redact_message(self):
+        nio = pytest.importorskip("nio")
+        mock_client = MagicMock()
+        mock_client.room_redact = AsyncMock(
+            return_value=MagicMock(spec=nio.RoomRedactResponse)
+        )
+        self.adapter._client = mock_client
+
+        result = await self.adapter.redact_message("!room:ex", "$ev1", "oops")
+        assert result is True
+        mock_client.room_redact.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_redact_no_client(self):
+        self.adapter._client = None
+        result = await self.adapter.redact_message("!room:ex", "$ev1")
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Room creation & invite
+# ---------------------------------------------------------------------------
+
+class TestMatrixRoomManagement:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+
+    @pytest.mark.asyncio
+    async def test_create_room(self):
+        nio = pytest.importorskip("nio")
+        mock_resp = MagicMock(spec=nio.RoomCreateResponse)
+        mock_resp.room_id = "!new:example.org"
+        mock_client = MagicMock()
+        mock_client.room_create = AsyncMock(return_value=mock_resp)
+        self.adapter._client = mock_client
+
+        room_id = await self.adapter.create_room(name="Test Room", topic="A test")
+        assert room_id == "!new:example.org"
+        assert "!new:example.org" in self.adapter._joined_rooms
+
+    @pytest.mark.asyncio
+    async def test_invite_user(self):
+        nio = pytest.importorskip("nio")
+        mock_client = MagicMock()
+        mock_client.room_invite = AsyncMock(
+            return_value=MagicMock(spec=nio.RoomInviteResponse)
+        )
+        self.adapter._client = mock_client
+
+        result = await self.adapter.invite_user("!room:ex", "@user:ex")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_create_room_no_client(self):
+        self.adapter._client = None
+        result = await self.adapter.create_room()
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Presence
+# ---------------------------------------------------------------------------
+
+class TestMatrixPresence:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+
+    @pytest.mark.asyncio
+    async def test_set_presence_valid(self):
+        mock_client = MagicMock()
+        mock_client.set_presence = AsyncMock()
+        self.adapter._client = mock_client
+
+        result = await self.adapter.set_presence("online")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_set_presence_invalid_state(self):
+        mock_client = MagicMock()
+        self.adapter._client = mock_client
+
+        result = await self.adapter.set_presence("busy")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_set_presence_no_client(self):
+        self.adapter._client = None
+        result = await self.adapter.set_presence("online")
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Emote & notice
+# ---------------------------------------------------------------------------
+
+class TestMatrixMessageTypes:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+
+    @pytest.mark.asyncio
+    async def test_send_emote(self):
+        nio = pytest.importorskip("nio")
+        mock_client = MagicMock()
+        mock_resp = MagicMock(spec=nio.RoomSendResponse)
+        mock_resp.event_id = "$emote1"
+        mock_client.room_send = AsyncMock(return_value=mock_resp)
+        self.adapter._client = mock_client
+
+        result = await self.adapter.send_emote("!room:ex", "waves hello")
+        assert result.success is True
+        call_args = mock_client.room_send.call_args[0]
+        assert call_args[2]["msgtype"] == "m.emote"
+
+    @pytest.mark.asyncio
+    async def test_send_notice(self):
+        nio = pytest.importorskip("nio")
+        mock_client = MagicMock()
+        mock_resp = MagicMock(spec=nio.RoomSendResponse)
+        mock_resp.event_id = "$notice1"
+        mock_client.room_send = AsyncMock(return_value=mock_resp)
+        self.adapter._client = mock_client
+
+        result = await self.adapter.send_notice("!room:ex", "System message")
+        assert result.success is True
+        call_args = mock_client.room_send.call_args[0]
+        assert call_args[2]["msgtype"] == "m.notice"
+
+    @pytest.mark.asyncio
+    async def test_send_emote_empty_text(self):
+        self.adapter._client = MagicMock()
+        result = await self.adapter.send_emote("!room:ex", "")
+        assert result.success is False

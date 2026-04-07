@@ -513,6 +513,16 @@ class MattermostAdapter(BasePlatformAdapter):
             except Exception as exc:
                 if self._closing:
                     return
+                # Detect permanent auth/permission failures that will never
+                # succeed on retry — stop reconnecting instead of looping forever.
+                import aiohttp
+                err_str = str(exc).lower()
+                if isinstance(exc, aiohttp.WSServerHandshakeError) and exc.status in (401, 403):
+                    logger.error("Mattermost WS auth failed (HTTP %d) — stopping reconnect", exc.status)
+                    return
+                if "401" in err_str or "403" in err_str or "unauthorized" in err_str:
+                    logger.error("Mattermost WS permanent error: %s — stopping reconnect", exc)
+                    return
                 logger.warning("Mattermost WS error: %s — reconnecting in %.0fs", exc, delay)
 
             if self._closing:
@@ -690,6 +700,15 @@ class MattermostAdapter(BasePlatformAdapter):
                         logger.warning("Mattermost: failed to download file %s: HTTP %s", fid, resp.status)
             except Exception as exc:
                 logger.warning("Mattermost: error downloading file %s: %s", fid, exc)
+
+        # Set message type based on downloaded media types.
+        if media_types and msg_type == MessageType.TEXT:
+            if any(m.startswith("image/") for m in media_types):
+                msg_type = MessageType.PHOTO
+            elif any(m.startswith("audio/") for m in media_types):
+                msg_type = MessageType.VOICE
+            elif media_types:
+                msg_type = MessageType.DOCUMENT
 
         source = self.build_source(
             chat_id=channel_id,

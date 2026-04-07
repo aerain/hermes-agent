@@ -1,5 +1,5 @@
 ---
-sidebar_position: 8
+sidebar_position: 9
 sidebar_label: "Build a Plugin"
 title: "Build a Hermes Plugin"
 description: "Step-by-step guide to building a complete Hermes plugin with tools, hooks, data files, and skills"
@@ -44,8 +44,12 @@ This tells Hermes: "I'm a plugin called calculator, I provide tools and hooks." 
 Optional fields you could add:
 ```yaml
 author: Your Name
-requires_env:          # gate loading on env vars
-  - SOME_API_KEY       # plugin disabled if missing
+requires_env:          # gate loading on env vars; prompted during install
+  - SOME_API_KEY       # simple format — plugin disabled if missing
+  - name: OTHER_KEY    # rich format — shows description/url during install
+    description: "Key for the Other service"
+    url: "https://other.com/keys"
+    secret: true
 ```
 
 ## Step 3: Write the tool schemas
@@ -237,7 +241,7 @@ def register(ctx):
 - Called exactly once at startup
 - `ctx.register_tool()` puts your tool in the registry — the model sees it immediately
 - `ctx.register_hook()` subscribes to lifecycle events
-- `ctx.register_command()` — _planned but not yet implemented_
+- `ctx.register_cli_command()` registers a CLI subcommand (e.g. `hermes my-plugin <subcommand>`)
 - If this function crashes, the plugin is disabled but Hermes continues fine
 
 ## Step 6: Test it
@@ -336,12 +340,34 @@ def register(ctx):
 If your plugin needs an API key:
 
 ```yaml
-# plugin.yaml
+# plugin.yaml — simple format (backwards-compatible)
 requires_env:
   - WEATHER_API_KEY
 ```
 
 If `WEATHER_API_KEY` isn't set, the plugin is disabled with a clear message. No crash, no error in the agent — just "Plugin weather disabled (missing: WEATHER_API_KEY)".
+
+When users run `hermes plugins install`, they're **prompted interactively** for any missing `requires_env` variables. Values are saved to `.env` automatically.
+
+For a better install experience, use the rich format with descriptions and signup URLs:
+
+```yaml
+# plugin.yaml — rich format
+requires_env:
+  - name: WEATHER_API_KEY
+    description: "API key for OpenWeather"
+    url: "https://openweathermap.org/api"
+    secret: true
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | Yes | Environment variable name |
+| `description` | No | Shown to user during install prompt |
+| `url` | No | Where to get the credential |
+| `secret` | No | If `true`, input is hidden (like a password field) |
+
+Both formats can be mixed in the same list. Already-set variables are skipped silently.
 
 ### Conditional tool availability
 
@@ -480,6 +506,44 @@ def register(ctx):
 #### Multiple plugins returning context
 
 When multiple plugins return context from `pre_llm_call`, their outputs are joined with double newlines and appended to the user message together. The order follows plugin discovery order (alphabetical by plugin directory name).
+
+### Register CLI commands
+
+Plugins can add their own `hermes <plugin>` subcommand tree:
+
+```python
+def _my_command(args):
+    """Handler for hermes my-plugin <subcommand>."""
+    sub = getattr(args, "my_command", None)
+    if sub == "status":
+        print("All good!")
+    elif sub == "config":
+        print("Current config: ...")
+    else:
+        print("Usage: hermes my-plugin <status|config>")
+
+def _setup_argparse(subparser):
+    """Build the argparse tree for hermes my-plugin."""
+    subs = subparser.add_subparsers(dest="my_command")
+    subs.add_parser("status", help="Show plugin status")
+    subs.add_parser("config", help="Show plugin config")
+    subparser.set_defaults(func=_my_command)
+
+def register(ctx):
+    ctx.register_tool(...)
+    ctx.register_cli_command(
+        name="my-plugin",
+        help="Manage my plugin",
+        setup_fn=_setup_argparse,
+        handler_fn=_my_command,
+    )
+```
+
+After registration, users can run `hermes my-plugin status`, `hermes my-plugin config`, etc.
+
+**Memory provider plugins** use a convention-based approach instead: add a `register_cli(subparser)` function to your plugin's `cli.py` file. The memory plugin discovery system finds it automatically — no `ctx.register_cli_command()` call needed. See the [Memory Provider Plugin guide](/docs/developer-guide/memory-provider-plugin#adding-cli-commands) for details.
+
+**Active-provider gating:** Memory plugin CLI commands only appear when their provider is the active `memory.provider` in config. If a user hasn't set up your provider, your CLI commands won't clutter the help output.
 
 ### Distribute via pip
 

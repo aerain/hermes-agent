@@ -90,8 +90,9 @@ class TestResolveDeliveryTarget:
         with patch(
             "gateway.channel_directory.resolve_channel_name",
             return_value="12345678901234@lid",
-        ):
+        ) as resolve_mock:
             result = _resolve_delivery_target(job)
+        resolve_mock.assert_called_once_with("whatsapp", "Alice (dm)")
         assert result == {
             "platform": "whatsapp",
             "chat_id": "12345678901234@lid",
@@ -110,6 +111,20 @@ class TestResolveDeliveryTarget:
             "platform": "telegram",
             "chat_id": "-1009999",
             "thread_id": None,
+        }
+
+    def test_human_friendly_topic_label_preserves_thread_id(self):
+        """Resolved Telegram topic labels should split chat_id and thread_id."""
+        job = {"deliver": "telegram:Coaching Chat / topic 17585 (group)"}
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            return_value="-1009999:17585",
+        ):
+            result = _resolve_delivery_target(job)
+        assert result == {
+            "platform": "telegram",
+            "chat_id": "-1009999",
+            "thread_id": "17585",
         }
 
     def test_raw_id_not_mangled_when_directory_returns_none(self):
@@ -234,6 +249,33 @@ class TestDeliverResultWrapping:
         assert sent_content == "Clean output only."
         assert "Cronjob Response" not in sent_content
         assert "The agent cannot see" not in sent_content
+
+    def test_delivery_extracts_media_tags_before_send(self):
+        """Cron delivery should pass MEDIA attachments separately to the send helper."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}):
+            job = {
+                "id": "voice-job",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            }
+            _deliver_result(job, "Title\nMEDIA:/tmp/test-voice.ogg")
+
+        send_mock.assert_called_once()
+        args, kwargs = send_mock.call_args
+        # Text content should have MEDIA: tag stripped
+        assert "MEDIA:" not in args[3]
+        assert "Title" in args[3]
+        # Media files should be forwarded separately
+        assert kwargs["media_files"] == [("/tmp/test-voice.ogg", False)]
 
     def test_no_mirror_to_session_call(self):
         """Cron deliveries should NOT mirror into the gateway session."""
@@ -667,6 +709,18 @@ class TestSilentDelivery:
             tick(verbose=False)
         deliver_mock.assert_not_called()
 
+    def test_silent_trailing_suppresses_delivery(self):
+        """Agent appended [SILENT] after explanation text — must still suppress."""
+        response = "2 deals filtered out (like<10, reply<15).\n\n[SILENT]"
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+            tick(verbose=False)
+        deliver_mock.assert_not_called()
+
     def test_silent_is_case_insensitive(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "[silent] nothing new", None)), \
@@ -714,6 +768,21 @@ class TestBuildJobPromptSilentHint:
         job = {"prompt": ""}
         result = _build_job_prompt(job)
         assert "[SILENT]" in result
+
+    def test_delivery_guidance_present(self):
+        """Cron hint tells agents their final response is auto-delivered."""
+        job = {"prompt": "Generate a report"}
+        result = _build_job_prompt(job)
+        assert "do NOT use send_message" in result
+        assert "automatically delivered" in result
+
+    def test_delivery_guidance_precedes_user_prompt(self):
+        """System guidance appears before the user's prompt text."""
+        job = {"prompt": "My custom prompt"}
+        result = _build_job_prompt(job)
+        system_pos = result.index("do NOT use send_message")
+        prompt_pos = result.index("My custom prompt")
+        assert system_pos < prompt_pos
 
 
 class TestBuildJobPromptMissingSkill:

@@ -11,6 +11,7 @@ Hermes Agent includes a full browser automation toolset with multiple backend op
 
 - **Browserbase cloud mode** via [Browserbase](https://browserbase.com) for managed cloud browsers and anti-bot tooling
 - **Browser Use cloud mode** via [Browser Use](https://browser-use.com) as an alternative cloud browser provider
+- **Firecrawl cloud mode** via [Firecrawl](https://firecrawl.dev) for cloud browsers with built-in scraping
 - **Camofox local mode** via [Camofox](https://github.com/jo-inc/camofox-browser) for local anti-detection browsing (Firefox-based fingerprint spoofing)
 - **Local Chrome via CDP** — connect browser tools to your own Chrome instance using `/browser connect`
 - **Local browser mode** via the `agent-browser` CLI and a local Chromium installation
@@ -23,7 +24,7 @@ Pages are represented as **accessibility trees** (text-based snapshots), making 
 
 Key capabilities:
 
-- **Multi-provider cloud execution** — Browserbase or Browser Use, no local browser needed
+- **Multi-provider cloud execution** — Browserbase, Browser Use, or Firecrawl — no local browser needed
 - **Local Chrome integration** — attach to your running Chrome via CDP for hands-on browsing
 - **Built-in stealth** — random fingerprints, CAPTCHA solving, residential proxies (Browserbase)
 - **Session isolation** — each task gets its own browser session
@@ -54,6 +55,32 @@ BROWSER_USE_API_KEY=***
 ```
 
 Get your API key at [browser-use.com](https://browser-use.com). Browser Use provides a cloud browser via its REST API. If both Browserbase and Browser Use credentials are set, Browserbase takes priority.
+
+### Firecrawl cloud mode
+
+To use Firecrawl as your cloud browser provider, add:
+
+```bash
+# Add to ~/.hermes/.env
+FIRECRAWL_API_KEY=fc-***
+```
+
+Get your API key at [firecrawl.dev](https://firecrawl.dev). Then select Firecrawl as your browser provider:
+
+```bash
+hermes setup tools
+# → Browser Automation → Firecrawl
+```
+
+Optional settings:
+
+```bash
+# Self-hosted Firecrawl instance (default: https://api.firecrawl.dev)
+FIRECRAWL_API_URL=http://localhost:3002
+
+# Session TTL in seconds (default: 300)
+FIRECRAWL_BROWSER_TTL=600
+```
 
 ### Camofox local mode
 
@@ -250,10 +277,6 @@ Check the browser console for any JavaScript errors
 
 Use `clear=True` to clear the console after reading, so subsequent calls only show new messages.
 
-### `browser_close`
-
-Close the browser session and release resources. Call this when done to free up Browserbase session quota.
-
 ## Practical Examples
 
 ### Filling Out a Web Form
@@ -268,7 +291,6 @@ Agent workflow:
 4. browser_type(ref="@e5", text="SecurePass123")
 5. browser_click(ref="@e8")  → clicks "Create Account"
 6. browser_snapshot()  → confirms success
-7. browser_close()
 ```
 
 ### Researching Dynamic Content
@@ -280,7 +302,6 @@ Agent workflow:
 1. browser_navigate("https://github.com/trending")
 2. browser_snapshot(full=true)  → reads trending repo list
 3. Returns formatted results
-4. browser_close()
 ```
 
 ## Session Recording
@@ -322,5 +343,5 @@ If paid features aren't available on your plan, Hermes automatically falls back 
 - **Text-based interaction** — relies on accessibility tree, not pixel coordinates
 - **Snapshot size** — large pages may be truncated or LLM-summarized at 8000 characters
 - **Session timeout** — cloud sessions expire based on your provider's plan settings
-- **Cost** — cloud sessions consume provider credits; use `browser_close` when done. Use `/browser connect` for free local browsing.
+- **Cost** — cloud sessions consume provider credits; sessions are automatically cleaned up when the conversation ends or after inactivity. Use `/browser connect` for free local browsing.
 - **No file downloads** — cannot download files from the browser

@@ -295,6 +295,42 @@ def auth_remove_command(args) -> None:
         raise SystemExit(f'No credential matching "{target}" for provider {provider}.')
     print(f"Removed {provider} credential #{index} ({removed.label})")
 
+    # If this was an env-seeded credential, also clear the env var from .env
+    # so it doesn't get re-seeded on the next load_pool() call.
+    if removed.source.startswith("env:"):
+        env_var = removed.source[len("env:"):]
+        if env_var:
+            from hermes_cli.config import remove_env_value
+            cleared = remove_env_value(env_var)
+            if cleared:
+                print(f"Cleared {env_var} from .env")
+
+    # If this was a singleton-seeded credential (OAuth device_code, hermes_pkce),
+    # clear the underlying auth store / credential file so it doesn't get
+    # re-seeded on the next load_pool() call.
+    elif removed.source == "device_code" and provider in ("openai-codex", "nous"):
+        from hermes_cli.auth import (
+            _load_auth_store, _save_auth_store, _auth_store_lock,
+        )
+        with _auth_store_lock():
+            auth_store = _load_auth_store()
+            providers_dict = auth_store.get("providers")
+            if isinstance(providers_dict, dict) and provider in providers_dict:
+                del providers_dict[provider]
+                _save_auth_store(auth_store)
+                print(f"Cleared {provider} OAuth tokens from auth store")
+
+    elif removed.source == "hermes_pkce" and provider == "anthropic":
+        from hermes_constants import get_hermes_home
+        oauth_file = get_hermes_home() / ".anthropic_oauth.json"
+        if oauth_file.exists():
+            oauth_file.unlink()
+            print("Cleared Hermes Anthropic OAuth credentials")
+
+    elif removed.source == "claude_code" and provider == "anthropic":
+        print("Note: Claude Code credentials live in ~/.claude/.credentials.json")
+        print("      Remove them manually if you want to deauthorize Claude Code.")
+
 
 def auth_reset_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", ""))

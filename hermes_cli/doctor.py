@@ -318,6 +318,25 @@ def run_doctor(args):
         except Exception:
             pass
 
+        # Validate config structure (catches malformed custom_providers, etc.)
+        try:
+            from hermes_cli.config import validate_config_structure
+            config_issues = validate_config_structure()
+            if config_issues:
+                print()
+                print(color("◆ Config Structure", Colors.CYAN, Colors.BOLD))
+                for ci in config_issues:
+                    if ci.severity == "error":
+                        check_fail(ci.message)
+                    else:
+                        check_warn(ci.message)
+                    # Show the hint indented
+                    for hint_line in ci.hint.splitlines():
+                        check_info(hint_line)
+                    issues.append(ci.message)
+        except Exception:
+            pass
+
     # =========================================================================
     # Check: Auth providers
     # =========================================================================
@@ -817,7 +836,7 @@ def run_doctor(args):
                 get_honcho_client(hcfg)
                 check_ok(
                     "Honcho connected",
-                    f"workspace={hcfg.workspace_id} mode={hcfg.memory_mode} freq={hcfg.write_frequency}",
+                    f"workspace={hcfg.workspace_id} mode={hcfg.recall_mode} freq={hcfg.write_frequency}",
                 )
             except Exception as _e:
                 check_fail("Honcho connection failed", str(_e))
